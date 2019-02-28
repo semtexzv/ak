@@ -1,0 +1,11 @@
+[package]
+name = "ak"
+version = "0.1.0"
+authors = ["Michal Hornický <semtexzv@gmail.com>"]
+description = "Actor library utilizing std futures"
+license = "MIT"
+edition = "2018"
+
+[dependencies]
+futures-preview = "0.3.0-alpha.13"
+tokio = "*"
