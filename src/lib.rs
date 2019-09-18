@@ -1,4 +1,4 @@
-#![feature(box_syntax, futures_api, await_macro, async_await, arbitrary_self_types, try_trait, specialization, impl_trait_in_bindings)]
+#![feature(box_syntax, arbitrary_self_types, try_trait, specialization)]
 #![allow(unused_imports, unused_mut, unused_variables, dead_code)]
 
 pub mod prelude;
@@ -15,7 +15,7 @@ pub(crate) use crate::types::*;
 
 macro_rules! suspend {
     ($this: ident, $expr : expr) => {{
-         let (mut tmp, res) = await!($this.suspend($expr));
+         let (mut tmp, res) = $this.suspend($expr).await;
          $this = tmp;
          res
     }};
@@ -23,7 +23,7 @@ macro_rules! suspend {
 
 macro_rules! try_suspend {
     ($this: ident, $expr : expr) => {{
-         let (mut tmp, res) = await!($this.suspend($expr));
+         let (mut tmp, res) = $this.suspend($expr).await;
          $this = tmp;
          if let Err(res) = res {
             return ($this,Err(res.into()));
@@ -34,16 +34,21 @@ macro_rules! try_suspend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::addr::Message;
 
-    fn computation() -> Box<Future<Output=()> + Unpin> {
+    fn computation() -> Box<dyn Future<Output=()> + Unpin> {
         panic!("Unimplemented")
     }
 
-    fn computation_res() -> Box<Future<Output=Result<(), String>> + Unpin> {
+    fn computation_res() -> Box<dyn Future<Output=Result<(), String>> + Unpin> {
         panic!("Unimplemented")
     }
 
     struct TestMessage;
+
+    impl Message for TestMessage {
+        type Result = ();
+    }
 
     struct TestActor {
         x: i32,
@@ -55,25 +60,28 @@ mod tests {
         type Result = Result<(), String>;
 
         fn handle(mut self: Context<Self>, m: TestMessage) -> Return<Self, Self::Result> {
-            Return::fut(async {
+            async {
                 let computed = suspend!(self, computation());
                 self.x += 1;
-                let comp2= try_suspend!(self, computation_res());
+                let comp2 = try_suspend!(self, computation_res());
 
                 self.spawn(computation());
                 self.x += 1;
                 (self, Ok(()))
-            })
+            }.into()
         }
     }
 
-    #[test]
-    fn test_size() {
+    #[tokio::test]
+    async fn test_basic() {
         let ta = TestActor {
             x: 0
         };
 
-        let ctx = Context::new(ta);
-        let _ = ctx.handle(TestMessage);
+        let addr = Context::new(|| ta);
+        let res = addr.send(TestMessage).boxed_local().await;
+        std::thread::sleep_ms(200);
+        //let res = ctx.handle(TestMessage);
+        //panic!("Res : {:?}", res);
     }
 }

@@ -8,4 +8,4 @@ edition = "2018"
 
 [dependencies]
 futures-preview = "0.3.0-alpha.13"
-tokio = "*"
+tokio = "0.2.0-alpha.4"
