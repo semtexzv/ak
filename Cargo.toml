@@ -6,6 +6,14 @@ description = "Actor library utilizing std futures"
 license = "MIT"
 edition = "2018"
 
+[[bin]]
+name ="main"
+path = "src/main.rs"
+
+[profile.release]
+debug = true
+
 [dependencies]
-futures-preview = "0.3.0-alpha.13"
-tokio = "0.2.0-alpha.4"
+async-trait = "0.1.13"
+futures-preview = { version  = "0.3.0-alpha.19", features = ["async-await"] }
+tokio = "0.2.0-alpha.6"
