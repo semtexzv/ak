@@ -14,3 +14,4 @@ pub(crate) use crate::actor::*;
 pub(crate) use crate::context::*;
 pub(crate) use crate::types::*;
 
+pub use ak_codegen::suspend;

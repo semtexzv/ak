@@ -5,6 +5,7 @@ authors = ["Michal Hornický <semtexzv@gmail.com>"]
 description = "Actor library utilizing std futures"
 license = "MIT"
 edition = "2018"
+repository = "https://github.com/semtexzv/ak"
 
 [[bin]]
 name ="main"
@@ -18,7 +19,13 @@ debug = true
 async-stream = "0.1.2"
 async-trait = "0.1.13"
 pin-utils = "0.1.0-alpha.4"
-suspend =  { path = "./suspend"}
 
 futures-preview = { version  = "0.3.0-alpha.19", features = ["async-await"] }
 tokio = "0.2.0-alpha.6"
+
+
+
+ak-codegen =  "0.1.0"
+
+[patch.crates-io]
+ak-codegen = { path = "./ak-codegen"}

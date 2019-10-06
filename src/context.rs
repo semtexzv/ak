@@ -56,10 +56,8 @@ pub struct ContextRef<A: Actor> {
 
 impl<A: Actor> ContextRef<A> {
     pub(crate) fn from_ctx_ref(ctx: &mut Context<A>) -> Self {
-        unsafe {
-            ContextRef {
-                data: ctx as *mut _
-            }
+        ContextRef {
+            data: ctx as *mut _
         }
     }
 }

@@ -12,60 +12,51 @@ pub(crate) use ak::context::*;
 pub(crate) use ak::types::*;
 
 use async_trait::async_trait;
-use ak::addr::Message;
+use ak::addr::{Message, Addr};
 use tokio::timer::delay_for;
 use std::time::Duration;
 use std::ops::Generator;
 use futures::StreamExt;
+use std::sync::mpsc::Sender;
 
-fn computation() -> Box<dyn Future<Output=()> + Unpin> {
-    panic!("Unimplemented")
+struct Payload(usize);
+
+impl Message for Payload {
+    type Result = ();
 }
 
-fn computation_res() -> Box<dyn Future<Output=Result<(), String>> + Unpin> {
-    panic!("Unimplemented")
+struct Node {
+    limit: usize,
+    next: Addr<Node>,
 }
 
-struct TestMessage;
+impl Actor for Node {}
 
-impl Message for TestMessage {
-    type Result = i32;
-}
+impl Handler<Payload> for Node {
+    type Future = impl Future<Output=()> + 'static;
 
-struct TestActor {
-    x: i32,
-}
-
-impl Actor for TestActor {}
-
-impl TestActor {
-    async fn bla(&mut self) -> &i32 {
-        &self.x
-    }
-}
-
-impl Handler<TestMessage> for TestActor {
-    type Future = impl Future<Output=i32> + 'static;
-
-
-    #[suspend::suspend]
-    fn handle(mut self: ContextRef<Self>, msg: TestMessage) -> Self::Future {
+    #[ak::suspend]
+    fn handle(mut self: ContextRef<Self>, msg: Payload) -> Self::Future {
         async move {
-            self.x += 1;
-            let x = self.x;
-            println!("Suspending {:?}", x);
-            self.stop();
-            if self.x > 1 {
-                delay_for(Duration::from_secs((2 * x) as _)).await;
+            if msg.0 >= self.limit {
+                println!("Reached limit of {} (payload was {})", self.limit, msg.0);
+                self.stop();
+                return;
             }
-            println!("Continuing {:?}", x);
-            return x;
+            self.next.send(Payload(msg.0 + 1)).await;
         }
     }
 }
 
+
+const NUM_NODES : usize = 500;
+const NUM_MSGS : usize = 500;
+
 #[tokio::main]
 async fn main() {
+
+    /*
+    let node =
     let ta = TestActor {
         x: 0
     };
@@ -83,4 +74,5 @@ async fn main() {
     for i in res.into_iter() {
         println!("Received count : {:?}", i)
     }
+    */
 }

@@ -60,7 +60,7 @@ impl<A: Actor> Addr<A> {
             let (mut tx, rx) = oneshot();
             let envelope = MessageEnvelope::<A, M>(msg, tx, PhantomData);
             let mut sent = sender.send(Box::new(envelope));
-            sent.await;
+            sent.await.unwrap();
             rx.await
         }
     }

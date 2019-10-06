@@ -1,0 +1,17 @@
+[package]
+name = "ak-codegen"
+version = "0.1.0"
+authors = ["Michal Hornický <semtexzv@gmail.com>"]
+description = "Proc-macros for the ak library"
+license = "MIT"
+edition = "2018"
+repository = "https://github.com/semtexzv/ak"
+
+[lib]
+proc-macro = true
+
+
+[dependencies]
+proc-macro2 = "*"
+syn = { version =  "1.0.5", features = ["full", "visit"] }
+quote = "1.0.2"
