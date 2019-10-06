@@ -1,6 +1,6 @@
 [package]
 name = "ak-codegen"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Michal Hornický <semtexzv@gmail.com>"]
 description = "Proc-macros for the ak library"
 license = "MIT"

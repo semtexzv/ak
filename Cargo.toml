@@ -1,31 +1,39 @@
 [package]
 name = "ak"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Michal Hornický <semtexzv@gmail.com>"]
-description = "Actor library utilizing std futures"
+description = "Actor library utilizing std::future"
 license = "MIT"
 edition = "2018"
 repository = "https://github.com/semtexzv/ak"
 
-[[bin]]
-name ="main"
-path = "src/main.rs"
-
-
 [profile.release]
 debug = true
 
+[dev-dependencies]
+tokio = "0.2.0-alpha.6"
+
 [dependencies]
-async-stream = "0.1.2"
 async-trait = "0.1.13"
 pin-utils = "0.1.0-alpha.4"
 
-futures-preview = { version  = "0.3.0-alpha.19", features = ["async-await"] }
-tokio = "0.2.0-alpha.6"
+[dependencies.futures]
+package = "futures-preview"
+version = "0.3.0-alpha.19"
+features = ["async-await"]
 
+[dependencies.codegen]
+package = "ak-codegen"
+version = "0.1.1"
 
+[dependencies.rt]
+package = "ak-rt"
+version = "0.1.0"
 
-ak-codegen =  "0.1.0"
+[workspace]
+members = [".", "ak-codegen", "ak-rt" ]
+
 
 [patch.crates-io]
 ak-codegen = { path = "./ak-codegen"}
+ak-rt = { path = "./ak-rt" }

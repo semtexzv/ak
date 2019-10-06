@@ -1,12 +1,20 @@
 use tokio::prelude::Future;
-use tokio::spawn;
+
+use tokio::runtime::current_thread::Runtime;
+
+thread_local! {
+
+};
 
 pub fn run(f: impl Future<Output=()>) {
-    tokio_executor::current_thread::block_on_all(async {
+    tokio::runtime::current_thread::Runtime::new().unwrap().block_on(async {
         f.await;
-    })
+    });
 }
 
-pub fn start(fut: impl Future<Output=()> + 'static) {
-    tokio_executor::current_thread::spawn(fut);
+pub fn spawn<F, Fut>(f: F)
+    where F: FnOnce() -> Fut ,
+          Fut: Future<Output=()> + 'static
+{
+    tokio::runtime::current_thread::spawn(f());
 }

@@ -1,24 +1,33 @@
 use crate::prelude::*;
 use crate::actor::Actor;
+use crate::addr::{Addr, Action, Message, BoxAction, FnAction};
 
-use crate::addr::{Addr, Envelope, Message, BoxEnvelope};
-use std::{task, mem};
-use futures::{select, Stream, channel::mpsc::{Sender, Receiver}, SinkExt, StreamExt};
-use std::sync::Arc;
-use std::cell::{RefCell, UnsafeCell};
-use futures::stream::FuturesUnordered;
-use std::collections::LinkedList;
-use std::ptr::NonNull;
+use std::{
+    collections::LinkedList,
+    cell::{RefCell, UnsafeCell},
+    sync::Arc,
+    task,
+    mem,
+    ptr::NonNull,
+};
+use futures::{
+    select,
+    Stream,
+    channel::mpsc::{Sender, Receiver},
+    SinkExt,
+    StreamExt,
+    stream::FuturesUnordered,
+};
+use futures::task::SpawnExt;
 
-
-pub type ActorItem<A> = LocalBoxFuture<'static, Option<BoxEnvelope<A>>>;
+pub type ActorItem<A> = LocalBoxFuture<'static, Option<BoxAction<A>>>;
 
 
 pub struct Context<A: Actor> {
     stack: usize,
-    sender: Sender<BoxEnvelope<A>>,
-    mailbox: Receiver<BoxEnvelope<A>>,
-    items: FuturesUnordered<ActorItem<A>>,
+    sender: Sender<BoxAction<A>>,
+    mailbox: Receiver<BoxAction<A>>,
+    pub(crate) items: FuturesUnordered<ActorItem<A>>,
     running: bool,
     actor: A,
 }
@@ -37,19 +46,6 @@ impl<A: Actor> DerefMut for Context<A> {
 }
 
 
-pub async fn dispatch<M: Message, A: Actor + crate::actor::Handler<M>>(ctx: &mut Context<A>, msg: M, mut tx: oneshot::Sender<M::Result>)
-{
-    use crate::actor::Handler;
-    let mut ctx_ref = ContextRef::from_ctx_ref(ctx);
-    let fut = ctx_ref.handle(msg);
-
-    ctx.items.push(async {
-        tx.send(fut.await);
-        None
-    }.boxed_local());
-}
-
-
 pub struct ContextRef<A: Actor> {
     data: *mut Context<A>,
 }
@@ -58,6 +54,12 @@ impl<A: Actor> ContextRef<A> {
     pub(crate) fn from_ctx_ref(ctx: &mut Context<A>) -> Self {
         ContextRef {
             data: ctx as *mut _
+        }
+    }
+
+    pub(crate) fn make_clone(&self) -> Self {
+        Self {
+            data: self.data
         }
     }
 }
@@ -79,7 +81,10 @@ impl<A: Actor> DerefMut for ContextRef<A> {
 impl<A: Actor> Context<A>
 {
     async fn into_future(mut self) {
-        loop {
+        let mut ctx_ref = ContextRef::from_ctx_ref(&mut self);
+        Actor::started(&mut ctx_ref);
+
+        'main: loop {
             if !self.running {
                 return;
             }
@@ -92,18 +97,16 @@ impl<A: Actor> Context<A>
             match select(next_msg, next_item).await {
                 Either::Left((msg, _)) => {
                     if let Some(msg) = msg {
-                        println!("Opening new message");
-                        msg.open(&mut self).await;
+                        msg.open(&mut self);
                     } else {
                         println!("Mailbox has closed");
-                        return;
+                        break 'main;
                     }
                 }
                 Either::Right((item, _)) => {
                     if let Some(env_opt) = item {
-                        println!("Internal future completed");
                         if let Some(envelope) = env_opt {
-                            envelope.open(&mut self).await;
+                            envelope.open(&mut self);
                         }
                     } else {
                         println!("Internal future none");
@@ -111,44 +114,59 @@ impl<A: Actor> Context<A>
                 }
             }
         }
+        Actor::stopping(&mut ctx_ref);
     }
 
 
-    pub fn sender(&self) -> Sender<BoxEnvelope<A>> {
+    pub fn addr(&self) -> Sender<BoxAction<A>> {
         self.sender.clone()
     }
 
 
-    pub fn start<F: FnOnce() -> A + Send + 'static>(create: F) -> Addr<A> {
-        let (tx, rx) = futures::channel::mpsc::channel(100);
+    pub fn create<F: FnOnce(Addr<A>) -> A + Send + 'static>(create: F) -> Addr<A>
+    {
+        let (tx, rx) = futures::channel::mpsc::channel(10);
 
         let sender = tx.clone();
 
 
-        std::thread::spawn(move || {
+        let addr = Addr { sender: tx };
+        let addr2 = addr.clone();
+        //std::thread::spawn(|| {
+        rt::spawn(|| async move {
             let mut items = FuturesUnordered::new();
             items.push(pending().boxed_local());
 
             let mut context = Context {
                 stack: 0,
-                actor: create(),
+                actor: create(addr2),
                 sender,
                 mailbox: rx,
                 items,
                 running: true,
             };
-
-            let mut rt = tokio::runtime::current_thread::Builder::new().build().unwrap();
-
-            rt.spawn(context.into_future());
-            rt.run().unwrap();
+            context.into_future().await;
         });
+        rt::run(async {});
+        // });
 
-        return Addr { sender: tx };
+        return addr;
     }
 
     pub fn stop(&mut self) {
         self.running = false;
+    }
+
+    pub fn spawn<F, Fut>(self: &mut ContextRef<A>, f: F)
+        where F: FnOnce(ContextRef<A>) -> Fut + 'static,
+              Fut: Future<Output=()> + 'static {
+        let this = self.make_clone();
+        // TODO: Check whether this is safe
+        self.items.push(async move {
+            let fut = f(this);
+            fut.await;
+            None
+        }.boxed_local());
     }
 
     pub async fn suspend<F>(mut self: ContextRef<A>, f: F) -> (ContextRef<A>, F::Output)
