@@ -1,14 +1,28 @@
 [package]
 name = "ak-rt"
 version = "0.1.1"
-authors = ["Michal Hornický <semtexzv@gmail.com>"]
-description = "Runtime for the ak library"
-license = "MIT"
+authors = ["Nikolay Kim <fafhrd91@gmail.com>"]
+description = "Actix runtime"
+keywords = ["network", "framework", "async", "futures"]
+homepage = "https://actix.rs"
+repository = "https://github.com/actix/actix-net.git"
+documentation = "https://docs.rs/actix-rt/"
+categories = ["network-programming", "asynchronous"]
+license = "MIT/Apache-2.0"
+exclude = [".gitignore", ".travis.yml", ".cargo/config", "appveyor.yml"]
 edition = "2018"
-repository = "https://github.com/semtexzv/ak"
+workspace = ".."
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "actix_rt"
+path = "src/lib.rs"
 
 [dependencies]
-tokio-executor = "0.2.0-alpha.6"
-tokio = { version = "0.2.0-alpha.6"}
+futures = { package = "futures-preview", version  = "0.3.0-alpha.19" }
+
+tokio = { version = "0.2.0-alpha.6" }
+tokio-timer = "=0.3.0-alpha.6"
+tokio-executor = "=0.2.0-alpha.6"
+tokio-net = "=0.2.0-alpha.6"
+
+copyless = "0.1.4"

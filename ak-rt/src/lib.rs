@@ -1,20 +1,27 @@
-use tokio::prelude::Future;
+//! A runtime implementation that runs everything on the current thread.
 
-use tokio::runtime::current_thread::Runtime;
+mod arbiter;
+mod builder;
+mod runtime;
+mod system;
 
-thread_local! {
+pub use self::arbiter::Arbiter;
+pub use self::builder::{Builder, SystemRunner};
+pub use self::runtime::Runtime;
+pub use self::system::System;
 
-};
-
-pub fn run(f: impl Future<Output=()>) {
-    tokio::runtime::current_thread::Runtime::new().unwrap().block_on(async {
-        f.await;
-    });
-}
-
-pub fn spawn<F, Fut>(f: F)
-    where F: FnOnce() -> Fut ,
-          Fut: Future<Output=()> + 'static
+/// Spawns a future on the current arbiter.
+///
+/// # Panics
+///
+/// This function panics if actix system is not running.
+pub fn spawn<F>(f: F)
+where
+    F: futures::Future<Output = ()>  + 'static,
 {
-    tokio::runtime::current_thread::spawn(f());
+    if !System::is_set() {
+        panic!("System is not running");
+    }
+
+    Arbiter::spawn(f);
 }
