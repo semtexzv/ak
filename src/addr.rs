@@ -2,54 +2,46 @@ use crate::prelude::*;
 use crate::actor::*;
 
 use futures::channel::mpsc::Sender;
-use crate::{AsyncRef, Context};
-use futures::SinkExt;
-use futures::channel::oneshot::{Sender as OneSender, Receiver as OneReceiver, channel as oneshot};
-use futures::executor::LocalSpawner;
+use crate::{Context, dispatch, ContextRef};
+use futures::{
+    SinkExt,
+    channel::oneshot::{Sender as OneSender, Receiver as OneReceiver, channel as oneshot, Canceled},
+    executor::LocalSpawner,
+};
+use async_trait::async_trait;
+use std::sync::Mutex;
 
 
-pub enum Envelope<'a, A: Actor> {
-    Noop,
-    Func(Box<dyn FnOnce(&mut Context<A>) + Send + 'a>),
-}
+pub type BoxEnvelope<A> = Box<dyn Envelope<A>>;
 
-impl<'a, A: Actor> Envelope<'a, A> {
-    pub(crate) fn noop() -> Envelope<'static, A> { Envelope::Noop }
-    pub(crate) fn func<F>(f: F) -> Self
-        where for<'r, 's> F: std::ops::FnOnce(&'r mut Context<'s, A>,) + Send + 'a
-    {
-        Envelope::Func(Box::new(f))
-    }
-    pub(crate) fn boxed(f: Box<dyn FnOnce(&mut Context<A>) + Send + 'static>) -> Self {
-        Envelope::Func(f)
-    }
-    pub(crate) fn apply(self, ctx: &mut Context<A>) {
-        match self {
-            Envelope::Noop => {}
-            Envelope::Func(fun) => {
-                fun(ctx)
-            }
-        }
+#[async_trait(?Send)]
+pub trait Envelope<A: Actor>: Send {
+    async fn open(self: Box<Self>, ctx: &mut Context<A>);
+    fn boxed(self) -> BoxEnvelope<A>
+        where Self: Sized + 'static {
+        Box::new(self)
     }
 }
 
-pub trait Response<A: Actor, M: Message> {
-    fn respond(self, ctx: &mut Context<A>, tx: OneSender<M::Result>);
-}
+pub struct MessageEnvelope<A, M: Message>(M, oneshot::Sender<M::Result>, PhantomData<A>);
 
-impl<A: Actor, M, F> Response<A, M> for F
-    where F: Future<Output=M::Result> + 'static,
-          M: Message
+unsafe impl<A, M: Message> Send for MessageEnvelope<A, M> {}
+
+
+#[async_trait(? Send)]
+impl<A, M> Envelope<A> for MessageEnvelope<A, M>
+    where A: Actor + Handler<M>,
+          M: Message + Send + 'static,
+          M::Result: Send + 'static
 {
-    fn respond(self, ctx: &mut Context<A>, mut tx: OneSender<M::Result>) {
-        ctx.spawn(async {
-            tx.send(self.await);
-        });
+    async fn open(self: Box<Self>, ctx: &mut Context<A>) {
+        let res = dispatch(ctx, self.0, self.1).await;
     }
 }
+
 
 pub struct Addr<A: Actor> {
-    pub(crate) sender: Sender<Envelope<'static, A>>,
+    pub(crate) sender: Sender<BoxEnvelope<A>>,
 }
 
 unsafe impl<A: Actor> Send for Addr<A> {}
@@ -59,21 +51,17 @@ pub trait Message: Send + 'static {
 }
 
 impl<A: Actor> Addr<A> {
-    pub async fn send<M: Message>(&self, msg: M) -> Result<M::Result, futures::channel::oneshot::Canceled>
-        where A: Handler<M>, M::Result: Send
+    pub fn send<M: Message>(&self, msg: M) -> impl Future<Output=Result<M::Result, Canceled>> + 'static
+        where A: Handler<M>, M::Result: Send {
 
-    {
         let mut sender = self.sender.clone();
-        let (mut tx, rx) = oneshot();
-        let envelope = Envelope::func(move |this: &mut Context<A>| {
-            println!("Before handle tx");
-            let tx = tx;
-            let responder = this.handle(msg);
-            responder.respond(this, tx);
-            println!("Dropping tx");
-        });
 
-        sender.send(envelope).await;
-        rx.await
+        async move {
+            let (mut tx, rx) = oneshot();
+            let envelope = MessageEnvelope::<A, M>(msg, tx, PhantomData);
+            let mut sent = sender.send(Box::new(envelope));
+            sent.await;
+            rx.await
+        }
     }
 }

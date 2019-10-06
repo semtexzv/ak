@@ -10,10 +10,15 @@ edition = "2018"
 name ="main"
 path = "src/main.rs"
 
+
 [profile.release]
 debug = true
 
 [dependencies]
+async-stream = "0.1.2"
 async-trait = "0.1.13"
+pin-utils = "0.1.0-alpha.4"
+suspend =  { path = "./suspend"}
+
 futures-preview = { version  = "0.3.0-alpha.19", features = ["async-await"] }
 tokio = "0.2.0-alpha.6"

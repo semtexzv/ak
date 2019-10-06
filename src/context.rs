@@ -1,93 +1,148 @@
 use crate::prelude::*;
 use crate::actor::Actor;
 
-use crate::addr::{Addr, Envelope};
+use crate::addr::{Addr, Envelope, Message, BoxEnvelope};
 use std::{task, mem};
 use futures::{select, Stream, channel::mpsc::{Sender, Receiver}, SinkExt, StreamExt};
 use std::sync::Arc;
 use std::cell::{RefCell, UnsafeCell};
 use futures::stream::FuturesUnordered;
 use std::collections::LinkedList;
+use std::ptr::NonNull;
 
 
-// Heap-stored information about an actor.
-// Should contain it's mailbox
-pub struct Context<'a, A: Actor> {
-    _a: PhantomData<A>,
-    sender: Sender<Envelope<'static, A>>,
-    mailbox: Receiver<Envelope<'static, A>>,
-    items: FuturesUnordered<LocalBoxFuture<'a, Envelope<'a, A>>>,
+pub type ActorItem<A> = LocalBoxFuture<'static, Option<BoxEnvelope<A>>>;
+
+
+pub struct Context<A: Actor> {
+    stack: usize,
+    sender: Sender<BoxEnvelope<A>>,
+    mailbox: Receiver<BoxEnvelope<A>>,
+    items: FuturesUnordered<ActorItem<A>>,
     running: bool,
     actor: A,
 }
 
-impl<'a, A: Actor> Deref for Context<'a, A> {
+impl<A: Actor> Deref for Context<A> {
     type Target = A;
     fn deref(&self) -> &A {
         &self.actor
     }
 }
 
-impl<'a, A: Actor> DerefMut for Context<'a, A> {
+impl<A: Actor> DerefMut for Context<A> {
     fn deref_mut(&mut self) -> &mut A {
         &mut self.actor
     }
 }
 
-impl<'a, A: Actor> Context<'a, A>
-{
-    fn future(mut self) -> impl Future<Output=()> + 'a {
-        async move {
-            while self.running {
-                let joined = select((&mut self.mailbox).next(), (&mut self.items).next());
 
-                match joined.await {
-                    // We have received a message
-                    Either::Left((mb, _)) => {
-                        if let Some(mut mb) = mb {
-                            mb.apply(&mut self)
-                        } else {}
+pub async fn dispatch<M: Message, A: Actor + crate::actor::Handler<M>>(ctx: &mut Context<A>, msg: M, mut tx: oneshot::Sender<M::Result>)
+{
+    use crate::actor::Handler;
+    let mut ctx_ref = ContextRef::from_ctx_ref(ctx);
+    let fut = ctx_ref.handle(msg);
+
+    ctx.items.push(async {
+        tx.send(fut.await);
+        None
+    }.boxed_local());
+}
+
+
+pub struct ContextRef<A: Actor> {
+    data: *mut Context<A>,
+}
+
+impl<A: Actor> ContextRef<A> {
+    pub(crate) fn from_ctx_ref(ctx: &mut Context<A>) -> Self {
+        unsafe {
+            ContextRef {
+                data: ctx as *mut _
+            }
+        }
+    }
+}
+
+impl<A: Actor> Deref for ContextRef<A> {
+    type Target = Context<A>;
+    fn deref(&self) -> &Context<A> {
+        unsafe { self.data.as_ref().unwrap() }
+    }
+}
+
+impl<A: Actor> DerefMut for ContextRef<A> {
+    fn deref_mut(&mut self) -> &mut Context<A> {
+        unsafe { self.data.as_mut().unwrap() }
+    }
+}
+
+
+impl<A: Actor> Context<A>
+{
+    async fn into_future(mut self) {
+        loop {
+            if !self.running {
+                return;
+            }
+            let mut next_msg = (&mut self.mailbox).next();
+            pin_utils::pin_mut!(next_msg);
+
+            let mut next_item = (&mut self.items).next();
+            pin_utils::pin_mut!(next_item);
+
+            match select(next_msg, next_item).await {
+                Either::Left((msg, _)) => {
+                    if let Some(msg) = msg {
+                        println!("Opening new message");
+                        msg.open(&mut self).await;
+                    } else {
+                        println!("Mailbox has closed");
+                        return;
                     }
-                    // Internal future has resolved
-                    Either::Right((item, _)) => {
-                        if let Some(mut item) = item {
-                            item.apply(&mut self)
+                }
+                Either::Right((item, _)) => {
+                    if let Some(env_opt) = item {
+                        println!("Internal future completed");
+                        if let Some(envelope) = env_opt {
+                            envelope.open(&mut self).await;
                         }
-                        // We did not get any internal futures resolved
+                    } else {
+                        println!("Internal future none");
                     }
                 }
             }
-
-            println!("Finished")
         }
     }
 
-    pub fn sender(&self) -> Sender<Envelope<'static, A>> {
+
+    pub fn sender(&self) -> Sender<BoxEnvelope<A>> {
         self.sender.clone()
     }
-    pub fn local_sender(&self) -> Sender<Envelope<A>> {
-        unsafe { mem::transmute(self.sender.clone()) }
-    }
-    pub fn get_ref<'b>(&'b self) -> AsyncRef<A> {
-        unsafe { AsyncRef(std::mem::transmute(self.sender.clone())) }
-    }
+
 
     pub fn start<F: FnOnce() -> A + Send + 'static>(create: F) -> Addr<A> {
-        let (tx, rx) = futures::channel::mpsc::channel(1);
+        let (tx, rx) = futures::channel::mpsc::channel(100);
 
         let sender = tx.clone();
+
+
         std::thread::spawn(move || {
-            let context = Context {
-                _a: PhantomData,
+            let mut items = FuturesUnordered::new();
+            items.push(pending().boxed_local());
+
+            let mut context = Context {
+                stack: 0,
                 actor: create(),
                 sender,
                 mailbox: rx,
-                items: FuturesUnordered::new(),
+                items,
                 running: true,
             };
 
             let mut rt = tokio::runtime::current_thread::Builder::new().build().unwrap();
-            rt.spawn(context.future());
+
+            rt.spawn(context.into_future());
             rt.run().unwrap();
         });
 
@@ -98,48 +153,11 @@ impl<'a, A: Actor> Context<'a, A>
         self.running = false;
     }
 
-    pub fn spawn<F: Future<Output=()> + 'a>(&mut self, f: F) {
-        self.items.push(async {
-            f.await;
-            Envelope::Noop
-        }.boxed_local());
-    }
-}
+    pub async fn suspend<F>(mut self: ContextRef<A>, f: F) -> (ContextRef<A>, F::Output)
+        where F: Future + 'static,
 
-
-// this struct contains pinned box to raw context values
-pub struct AsyncRef<A: Actor>(Sender<Envelope<'static, A>>);
-
-impl<A: Actor> AsyncRef<A> {
-    pub async fn sync<F, O>(mut self, f: F) -> O
-        where F: FnOnce(&mut Context<A>) -> O + Send + 'static,
-              O: Send + 'static
     {
-        let (mut tx, rx) = oneshot::channel();
-        self.0.send(Envelope::func(move |this: &mut Context<A>| {
-            let res = f(this);
-            tx.send(res);
-        })).await;
-        rx.await.unwrap()
-    }
-
-    pub fn within<Fn, FF, O>(mut self, f: Fn) -> impl Future<Output=(AsyncRef<A>, O)>
-        where Fn: FnOnce(&mut Context<A>) -> FF + Send + 'static,
-              FF: Future<Output=O> + 'static,
-              O: Send + 'static,
-    {
-        //let (mut tx, rx) = oneshot::channel();
-        async {
-            /*self.0.send(Envelope::func(move |this: &mut Context<A>| {
-                let res = f(this);
-                /*this.spawn(async {
-                    let res = res.await;
-                    tx.send(res);
-                });*/
-            })).await;
-            (self, rx.await.unwrap())*/
-            unimplemented!()
-        }
+        (self, f.await)
     }
 }
 

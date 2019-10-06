@@ -1,5 +1,6 @@
 #![feature(type_alias_impl_trait, arbitrary_self_types, try_trait)]
 #![allow(unused_imports, unused_mut, unused_variables, dead_code)]
+#![feature(generators, generator_trait)]
 
 pub mod prelude;
 pub mod actor;

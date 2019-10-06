@@ -1,7 +1,7 @@
 #![feature(arbitrary_self_types)]
 #![feature(type_alias_impl_trait)]
+#![feature(generators, generator_trait)]
 
-use tokio::*;
 use std::future::Future;
 use futures::future::FutureExt;
 use futures::future::LocalBoxFuture;
@@ -11,8 +11,12 @@ pub(crate) use ak::actor::*;
 pub(crate) use ak::context::*;
 pub(crate) use ak::types::*;
 
-
+use async_trait::async_trait;
 use ak::addr::Message;
+use tokio::timer::delay_for;
+use std::time::Duration;
+use std::ops::Generator;
+use futures::StreamExt;
 
 fn computation() -> Box<dyn Future<Output=()> + Unpin> {
     panic!("Unimplemented")
@@ -25,9 +29,8 @@ fn computation_res() -> Box<dyn Future<Output=Result<(), String>> + Unpin> {
 struct TestMessage;
 
 impl Message for TestMessage {
-    type Result = ();
+    type Result = i32;
 }
-
 
 struct TestActor {
     x: i32,
@@ -36,30 +39,28 @@ struct TestActor {
 impl Actor for TestActor {}
 
 impl TestActor {
-    async fn bla(&self) -> i32 {
-        self.x
+    async fn bla(&mut self) -> &i32 {
+        &self.x
     }
 }
 
-
 impl Handler<TestMessage> for TestActor {
-    type Result = impl Future<Output=()>;
-
-    fn handle(mut self: &mut Context<Self>, msg: TestMessage) -> Self::Result {
-        self.x += 1;
-
-        let this = self.get_ref();
-
-        async {
-            let (this2,compute) = this.within(|this| async move {
-                this.bla().await
-            }).await;
+    type Future = impl Future<Output=i32> + 'static;
 
 
-            let y = compute;
-            print!("y {:?}", y);
-        };
-        async {}
+    #[suspend::suspend]
+    fn handle(mut self: ContextRef<Self>, msg: TestMessage) -> Self::Future {
+        async move {
+            self.x += 1;
+            let x = self.x;
+            println!("Suspending {:?}", x);
+            self.stop();
+            if self.x > 1 {
+                delay_for(Duration::from_secs((2 * x) as _)).await;
+            }
+            println!("Continuing {:?}", x);
+            return x;
+        }
     }
 }
 
@@ -71,8 +72,15 @@ async fn main() {
 
     let addr = Context::start(|| ta);
 
-    for i in 0..50 {
-        let res = addr.send(TestMessage).boxed_local().await;
-        assert_eq!(res, Ok(()));
+    let mut sent = vec![];
+    for i in 0..3i32 {
+        sent.push(addr.send(TestMessage).boxed_local());
+        println!("Sent")
+    }
+    sent.pop();
+    let res = futures::future::join_all(sent).await;
+
+    for i in res.into_iter() {
+        println!("Received count : {:?}", i)
     }
 }
