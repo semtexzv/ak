@@ -19,15 +19,20 @@ use futures::{
     stream::FuturesUnordered,
 };
 use futures::task::SpawnExt;
+use crate::addr::send::AddrSender;
+use std::process::Output;
 
 pub type ActorItem<A> = LocalBoxFuture<'static, Option<BoxAction<A>>>;
 
 
 pub struct Context<A: Actor> {
-    stack: usize,
-    sender: Sender<BoxAction<A>>,
+    sender: AddrSender<A>,
     mailbox: Receiver<BoxAction<A>>,
-    pub(crate) items: FuturesUnordered<ActorItem<A>>,
+    new_items: Vec<ActorItem<A>>,
+
+    items: FuturesUnordered<ActorItem<A>>,
+
+    waker: Option<Waker>,
     running: bool,
     actor: A,
 }
@@ -78,77 +83,95 @@ impl<A: Actor> DerefMut for ContextRef<A> {
 }
 
 
+impl<A: Actor> Future for Context<A> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        unsafe {
+            'main: loop {
+                let mut modified = false;
+                let mut this = Pin::get_unchecked_mut(self.as_mut());
+                this.waker = Some(cx.waker().clone());
+
+
+                for item in this.new_items.drain(..) {
+                    this.items.push(item);
+                }
+                'mb: loop {
+                    match Pin::new_unchecked(&mut this.mailbox).poll_next(cx) {
+                        Poll::Ready(Some(next)) => {
+                            modified = true;
+                            next.open(&mut this);
+                        }
+                        Poll::Ready(None) => {
+                            panic!("Malbox closed")
+                        }
+                        Poll::Pending => {
+                            break 'mb;
+                        }
+                    }
+                }
+                'it: loop {
+                    match Pin::new_unchecked(&mut this.items).poll_next(cx) {
+                        Poll::Ready(Some(next)) => {
+                            if let Some(envelope) = next {
+                                println!("Opening item");
+                                modified = true;
+                                envelope.open(this);
+                            }
+                        }
+                        Poll::Ready(None) => {
+                            break 'it;
+                        }
+                        Poll::Pending => {
+                            break 'it;
+                        }
+                    }
+                }
+
+                if !modified {
+                    break 'main;
+                }
+            }
+            return Poll::Pending;
+        }
+    }
+}
+
 impl<A: Actor> Context<A>
 {
-    async fn into_future(mut self) {
-        let mut ctx_ref = ContextRef::from_ctx_ref(&mut self);
-        Actor::started(&mut ctx_ref);
-
-        'main: loop {
-            if !self.running {
-                return;
-            }
-            let mut next_msg = (&mut self.mailbox).next();
-            pin_utils::pin_mut!(next_msg);
-
-            let mut next_item = (&mut self.items).next();
-            pin_utils::pin_mut!(next_item);
-
-            match select(next_msg, next_item).await {
-                Either::Left((msg, _)) => {
-                    if let Some(msg) = msg {
-                        msg.open(&mut self);
-                    } else {
-                        println!("Mailbox has closed");
-                        break 'main;
-                    }
-                }
-                Either::Right((item, _)) => {
-                    if let Some(env_opt) = item {
-                        if let Some(envelope) = env_opt {
-                            envelope.open(&mut self);
-                        }
-                    } else {
-                        println!("Internal future none");
-                    }
-                }
-            }
-        }
-        Actor::stopping(&mut ctx_ref);
-    }
-
-
-    pub fn addr(&self) -> Sender<BoxAction<A>> {
+    pub fn sender(&self) -> AddrSender<A> {
         self.sender.clone()
     }
 
+    pub fn create<F, Fut>(create: F) -> Addr<A>
+        where F: FnOnce(Addr<A>) -> Fut + Send + 'static,
+              Fut: Future<Output=A> + 'static
 
-    pub fn create<F: FnOnce(Addr<A>) -> A + Send + 'static>(create: F) -> Addr<A>
     {
-        let (tx, rx) = futures::channel::mpsc::channel(10);
+        let (tx, rx) = crate::addr::send::channel();
 
         let sender = tx.clone();
 
 
         let addr = Addr { sender: tx };
         let addr2 = addr.clone();
-        //std::thread::spawn(|| {
-        rt::spawn(|| async move {
+        rt::spawn(async move {
             let mut items = FuturesUnordered::new();
             items.push(pending().boxed_local());
 
+            let actor = create(addr2).await;
             let mut context = Context {
-                stack: 0,
-                actor: create(addr2),
+                new_items: vec![],
+                actor,
                 sender,
                 mailbox: rx,
                 items,
+                waker: None,
                 running: true,
             };
-            context.into_future().await;
-        });
-        rt::run(async {});
-        // });
+            context.await;
+        }.boxed_local());
 
         return addr;
     }
@@ -157,12 +180,19 @@ impl<A: Actor> Context<A>
         self.running = false;
     }
 
+    pub fn add_item(&mut self, f: ActorItem<A>) {
+        self.new_items.push(f);
+        if let Some(ref waker) = &self.waker {
+            waker.wake_by_ref();
+        }
+    }
+
     pub fn spawn<F, Fut>(self: &mut ContextRef<A>, f: F)
         where F: FnOnce(ContextRef<A>) -> Fut + 'static,
               Fut: Future<Output=()> + 'static {
         let this = self.make_clone();
-        // TODO: Check whether this is safe
-        self.items.push(async move {
+
+        self.add_item(async move {
             let fut = f(this);
             fut.await;
             None

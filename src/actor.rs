@@ -13,6 +13,13 @@ pub trait Actor: Sized + 'static {
         where
             F: FnOnce(Addr<Self>) -> Self + Send + 'static
     {
+        Context::create(|addr| async { f(addr) })
+    }
+    fn start_async<F, Fut>(f: F) -> Addr<Self>
+        where
+            F: FnOnce(Addr<Self>) -> Fut + Send + 'static,
+            Fut: Future<Output=Self>  + 'static
+    {
         Context::create(|addr| f(addr))
     }
 }

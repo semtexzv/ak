@@ -66,26 +66,28 @@ const NUM_MSGS: usize = 1000;
 
 
 fn main() {
-    fn create(limit: usize, count: usize) -> Option<Addr<Node>> {
-        if count > 0 {
-            Some(Context::create(move |_| Node {
-                id: NUM_NODES - count,
-                limit,
-                next: create(limit, count - 1),
-            }))
-        } else {
-            None
-        }
-    };
+    ak::rt::System::run(|| {
+        fn create(limit: usize, count: usize) -> Option<Addr<Node>> {
+            if count > 0 {
+                Some(Node::start(move |_| Node {
+                    id: NUM_NODES - count,
+                    limit,
+                    next: create(limit, count - 1),
+                }))
+            } else {
+                None
+            }
+        };
 
-    ak::rt::spawn(||  async {
-        let first_node = create(NUM_NODES * NUM_MSGS, NUM_NODES).unwrap();
-        first_node.send(FirstAddr(first_node.clone())).await;
+        ak::rt::spawn(async {
+            let first_node = create(NUM_NODES * NUM_MSGS, NUM_NODES).unwrap();
+            first_node.send(FirstAddr(first_node.clone())).await;
 
-        let t = SystemTime::now();
-        first_node.send(Payload(0)).await;
+            let t = SystemTime::now();
+            first_node.send(Payload(0)).await;
 
-        let elapsed = t.elapsed().unwrap();
-        println!("Elapsed : {}.{:06} seconds", elapsed.as_secs(), elapsed.subsec_micros());
+            let elapsed = t.elapsed().unwrap();
+            println!("Elapsed : {}.{:06} seconds", elapsed.as_secs(), elapsed.subsec_micros());
+        });
     });
 }
