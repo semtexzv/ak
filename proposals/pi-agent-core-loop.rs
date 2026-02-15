@@ -1,59 +1,59 @@
 // =============================================================================
-// Pi Agent Core Loop — Rust Proposal
+// Pi Agent Core Loop — Rust Proposal (v2: Cooperative State Machine)
 // =============================================================================
 //
-// A synchronous, single-threaded agent core loop inspired by pi-agent-core
-// (badlogic/pi-mono). No async in the core loop. Extension via traits and
-// closures with zero mandatory allocations in the hot path.
+// Revision of the original blocking-loop design. The core loop is now a
+// **cooperative state machine** that never blocks. It yields `Effect` values
+// at every I/O boundary — the caller (the "driver") performs the actual I/O,
+// updates the UI, checks for interrupts, and feeds results back.
 //
-// Design goals:
-//   1. Synchronous core — the loop is a plain `while` loop, no executor needed.
-//   2. Transport-agnostic — callers supply a `Transport` impl (HTTP, mock, etc.)
-//   3. Extensible tools — tools are trait objects with schema-driven validation.
-//   4. Event-driven observability — every state transition emits an `Event`.
-//   5. Interruptible — steering messages can abort in-flight tool execution.
-//   6. Serialisable state — `AgentState` is `Serialize + Deserialize` for
-//      session persistence, branching, and restore.
+// This gives the caller full control over:
+//   - When and how I/O happens (sync, async, threaded, polled)
+//   - UI updates between every interaction point
+//   - Interrupt/steering injection at any yield point
+//   - Streaming token display during LLM calls
+//   - Parallel tool execution (caller's choice, not baked in)
 //
-// The file is structured as a single-crate sketch. Production code would split
-// this across modules (types.rs, tool.rs, transport.rs, loop.rs, agent.rs).
+// The core loop itself: zero I/O, zero blocking, zero async, zero threads.
+// Pure data in → data out.
+//
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │                         ARCHITECTURE                               │
+// │                                                                    │
+// │   ┌──────────────┐  Effect   ┌──────────────┐                     │
+// │   │              │ ────────> │              │                     │
+// │   │  AgentLoop   │           │    Driver    │  ← caller code      │
+// │   │  (pure FSM)  │ <──────── │  (your code) │                     │
+// │   │              │  Resume   │              │                     │
+// │   └──────────────┘           └──────┬───────┘                     │
+// │         │                           │                             │
+// │         │ state                     │ performs I/O, UI, etc.      │
+// │         ▼                           ▼                             │
+// │   ┌──────────────┐           ┌──────────────┐                     │
+// │   │  AgentState   │           │  Transport   │                     │
+// │   │  (serialise)  │           │  Tools       │                     │
+// │   └──────────────┘           │  TUI/GUI     │                     │
+// │                              └──────────────┘                     │
+// └─────────────────────────────────────────────────────────────────────┘
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::mpsc;
-use std::time::Instant;
 
-// ---------------------------------------------------------------------------
-// 1. Content & Message types
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+// PART 1: Data types (same as v1, included for completeness)
+// ═══════════════════════════════════════════════════════════════════════
 
-/// A content block inside a message — mirrors LLM content arrays.
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
     Text(String),
     ToolCall(ToolCall),
     ToolResult(ToolResult),
-    /// Extension point: embedders can smuggle domain-specific blocks through.
-    Custom(Box<dyn CustomContent>),
-}
-
-/// Trait for user-defined content blocks (images, documents, …).
-pub trait CustomContent: fmt::Debug + Send + 'static {
-    fn type_name(&self) -> &str;
-    fn clone_box(&self) -> Box<dyn CustomContent>;
-}
-
-impl Clone for Box<dyn CustomContent> {
-    fn clone(&self) -> Self {
-        self.clone_box()
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    /// JSON-encoded arguments.
     pub arguments: String,
 }
 
@@ -68,7 +68,6 @@ pub struct ToolResult {
 pub enum Role {
     User,
     Assistant,
-    System,
 }
 
 #[derive(Debug, Clone)]
@@ -85,26 +84,30 @@ impl Message {
         }
     }
 
-    pub fn tool_calls(&self) -> Vec<&ToolCall> {
-        self.content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolCall(tc) => Some(tc),
-                _ => None,
-            })
-            .collect()
+    pub fn tool_result(call_id: impl Into<String>, content: Vec<ContentBlock>, is_error: bool) -> Self {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: call_id.into(),
+                content,
+                is_error,
+            })],
+        }
     }
 
-    pub fn has_tool_calls(&self) -> bool {
+    fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.content.iter().filter_map(|b| match b {
+            ContentBlock::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+    }
+
+    fn has_tool_calls(&self) -> bool {
         self.content
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolCall(_)))
     }
 }
-
-// ---------------------------------------------------------------------------
-// 2. Stop reason
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -112,14 +115,75 @@ pub enum StopReason {
     ToolUse,
     MaxTokens,
     Error,
-    Aborted,
 }
 
-// ---------------------------------------------------------------------------
-// 3. Transport — the only I/O boundary
-// ---------------------------------------------------------------------------
+#[derive(Debug, Clone)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: String,
+}
 
-/// Response from the LLM after a single inference call.
+// ═══════════════════════════════════════════════════════════════════════
+// PART 2: The Effect/Resume protocol — the core abstraction
+// ═══════════════════════════════════════════════════════════════════════
+
+/// What the loop needs the outside world to do.
+///
+/// The caller receives an `Effect`, performs the actual work (I/O, UI update,
+/// tool execution, …) however it wants, then calls the corresponding
+/// `resume_*` method to advance the state machine.
+#[derive(Debug)]
+pub enum Effect {
+    /// The loop needs an LLM inference call.
+    ///
+    /// Caller should:
+    ///   1. Optionally transform/compact the context
+    ///   2. Send to the LLM (streaming or not — caller's choice)
+    ///   3. While waiting: update UI, check for user interrupts
+    ///   4. Call `resume_llm()` with the final response
+    ///
+    /// The request borrows nothing — caller owns it fully.
+    NeedLlm(LlmRequest),
+
+    /// The loop needs a tool executed.
+    ///
+    /// Caller should:
+    ///   1. Look up the tool by name
+    ///   2. Execute it (in-thread, spawned, pooled — caller's choice)
+    ///   3. While waiting: update UI, check for user interrupts
+    ///   4. Call `resume_tool()` with the result
+    NeedToolExec(ToolCallRequest),
+
+    /// An observable event happened inside the state machine.
+    ///
+    /// Caller should handle it (log, update UI, send metrics, …) then call
+    /// `resume()` to continue. Events never require a response value — they
+    /// are pure notifications.
+    Event(Event),
+
+    /// The loop is finished. Terminal state — no more resume calls needed.
+    Done(EndReason),
+}
+
+/// Data needed to make an LLM call. Fully owned — the caller can mutate,
+/// cache, retry, or discard it.
+#[derive(Debug, Clone)]
+pub struct LlmRequest {
+    pub system_prompt: String,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolSchema>,
+}
+
+/// Data needed to execute a tool.
+#[derive(Debug, Clone)]
+pub struct ToolCallRequest {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Result of an LLM call, provided by the caller.
 pub struct LlmResponse {
     pub message: Message,
     pub stop_reason: StopReason,
@@ -127,22 +191,22 @@ pub struct LlmResponse {
     pub output_tokens: u64,
 }
 
-/// The transport trait abstracts the LLM call. Implementations can be
-/// synchronous HTTP calls, mock responses, or thin wrappers around async
-/// runtimes (`block_on`). The core loop never touches a runtime.
-pub trait Transport {
-    /// Send the full message history and get back a single assistant response.
-    /// Called synchronously — if the implementation needs async, it blocks
-    /// internally (e.g. via `tokio::runtime::Handle::block_on`).
-    fn send(
-        &self,
-        system: &str,
-        messages: &[Message],
-        tools: &[ToolSchema],
-        abort: &AbortFlag,
-    ) -> Result<LlmResponse, TransportError>;
+/// Result of a tool execution, provided by the caller.
+pub struct ToolExecResult {
+    pub content: Vec<ContentBlock>,
+    pub is_error: bool,
 }
 
+impl ToolExecResult {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self { content: vec![ContentBlock::Text(s.into())], is_error: false }
+    }
+    pub fn error(s: impl Into<String>) -> Self {
+        Self { content: vec![ContentBlock::Text(s.into())], is_error: true }
+    }
+}
+
+/// Transport error reported by the caller.
 #[derive(Debug)]
 pub enum TransportError {
     Network(String),
@@ -154,158 +218,41 @@ pub enum TransportError {
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TransportError::Network(e) => write!(f, "network: {e}"),
-            TransportError::RateLimit { retry_after_ms } => {
-                write!(f, "rate limited, retry after {retry_after_ms}ms")
-            }
-            TransportError::Auth(e) => write!(f, "auth: {e}"),
-            TransportError::Other(e) => write!(f, "{e}"),
+            Self::Network(e) => write!(f, "network: {e}"),
+            Self::RateLimit { retry_after_ms } => write!(f, "rate limited ({retry_after_ms}ms)"),
+            Self::Auth(e) => write!(f, "auth: {e}"),
+            Self::Other(e) => write!(f, "{e}"),
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// 4. Tool system
-// ---------------------------------------------------------------------------
-
-/// JSON Schema fragment describing a tool's parameters. In production this
-/// would be a proper JSON Schema type; here we use a string for brevity.
-#[derive(Debug, Clone)]
-pub struct ToolSchema {
-    pub name: String,
-    pub description: String,
-    /// JSON Schema for the `arguments` object.
-    pub parameters_schema: String,
-}
-
-/// Result of a single tool execution.
-pub struct ToolExecResult {
-    pub content: Vec<ContentBlock>,
-    pub is_error: bool,
-}
-
-impl ToolExecResult {
-    pub fn text(s: impl Into<String>) -> Self {
-        ToolExecResult {
-            content: vec![ContentBlock::Text(s.into())],
-            is_error: false,
-        }
-    }
-
-    pub fn error(s: impl Into<String>) -> Self {
-        ToolExecResult {
-            content: vec![ContentBlock::Text(s.into())],
-            is_error: true,
-        }
-    }
-}
-
-/// A tool that the agent can invoke. Implementations are synchronous — if a
-/// tool needs to run a subprocess, it blocks. This keeps the trait trivial
-/// to implement and test.
-pub trait Tool: Send {
-    fn schema(&self) -> ToolSchema;
-
-    /// Execute the tool. `arguments` is the raw JSON string from the model.
-    /// The `abort` flag should be polled periodically in long-running tools.
-    fn execute(
-        &self,
-        call_id: &str,
-        arguments: &str,
-        abort: &AbortFlag,
-    ) -> ToolExecResult;
-}
-
-// ---------------------------------------------------------------------------
-// 5. Abort flag
-// ---------------------------------------------------------------------------
-
-/// A thread-safe flag for cooperative cancellation. Checked by tools and the
-/// transport during long-running operations.
-pub struct AbortFlag {
-    inner: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl AbortFlag {
-    pub fn new() -> Self {
-        AbortFlag {
-            inner: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    pub fn abort(&self) {
-        self.inner
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    pub fn is_aborted(&self) -> bool {
-        self.inner.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn reset(&self) {
-        self.inner
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    pub fn clone_flag(&self) -> Self {
-        AbortFlag {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 6. Events
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+// PART 3: Events — observability without coupling
+// ═══════════════════════════════════════════════════════════════════════
 
 #[derive(Debug)]
 pub enum Event {
     AgentStart,
     TurnStart { turn: u32 },
-    /// The model produced a response.
     AssistantMessage { message: Message },
     ToolExecStart { call_id: String, name: String },
     ToolExecEnd { call_id: String, result: ToolResult },
-    /// A steering message was injected mid-turn.
     Steered { message: Message },
     TurnEnd { turn: u32 },
-    AgentEnd { reason: AgentEndReason },
-    /// Token accounting per turn.
     TokenUsage { input: u64, output: u64 },
 }
 
 #[derive(Debug)]
-pub enum AgentEndReason {
-    /// Model stopped on its own (no more tool calls).
+pub enum EndReason {
     Done,
-    /// Aborted via the abort flag.
     Aborted,
-    /// Unrecoverable transport error.
     Error(String),
 }
 
-/// Sink for events. Implementations can log, update a TUI, send over a
-/// channel, or aggregate metrics. Multiple sinks can be composed.
-pub trait EventSink: Send {
-    fn on_event(&mut self, event: &Event);
-}
+// ═══════════════════════════════════════════════════════════════════════
+// PART 4: Agent state (serialisable, cloneable, branchable)
+// ═══════════════════════════════════════════════════════════════════════
 
-/// Trivial sink that discards everything.
-pub struct NullSink;
-impl EventSink for NullSink {
-    fn on_event(&mut self, _: &Event) {}
-}
-
-/// Sink that forwards to an `mpsc::Sender`.
-pub struct ChannelSink(pub mpsc::Sender<Event>);
-// (Event would need Clone for this; omitted for sketch clarity.)
-
-// ---------------------------------------------------------------------------
-// 7. Agent state (serialisable core)
-// ---------------------------------------------------------------------------
-
-/// Everything needed to freeze and restore a session. The `messages` vec is
-/// the conversation history; `pending_tool_calls` is normally empty at rest.
 #[derive(Debug, Clone)]
 pub struct AgentState {
     pub system_prompt: String,
@@ -317,7 +264,7 @@ pub struct AgentState {
 
 impl AgentState {
     pub fn new(system_prompt: impl Into<String>) -> Self {
-        AgentState {
+        Self {
             system_prompt: system_prompt.into(),
             messages: Vec::new(),
             turn: 0,
@@ -327,501 +274,734 @@ impl AgentState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8. Message queues (steering & follow-up)
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+// PART 5: The state machine — the actual core loop
+// ═══════════════════════════════════════════════════════════════════════
 
-/// Two-queue system for injecting messages into the loop at safe points.
-///
-/// - **Steering**: delivered after the current tool finishes; remaining
-///   queued tool calls in the batch are skipped.
-/// - **Follow-up**: delivered only when the agent would otherwise stop
-///   (no pending tool calls, no steering messages).
-pub struct MessageQueues {
-    steering: VecDeque<Message>,
-    follow_up: VecDeque<Message>,
+/// Internal phase of the state machine.
+#[derive(Debug)]
+enum Phase {
+    /// Just started, or processing events before first LLM call.
+    Init,
+    /// Yielded NeedLlm, waiting for resume_llm().
+    WaitingForLlm,
+    /// Yielded NeedToolExec, waiting for resume_tool().
+    WaitingForTool,
+    /// Yielded Event, waiting for resume().
+    WaitingForEventAck,
+    /// Terminal.
+    Done,
 }
 
-impl MessageQueues {
-    pub fn new() -> Self {
-        MessageQueues {
-            steering: VecDeque::new(),
-            follow_up: VecDeque::new(),
+pub struct AgentLoop {
+    state: AgentState,
+    tool_schemas: Vec<ToolSchema>,
+    phase: Phase,
+
+    /// Tool calls from the current assistant response, waiting to be executed.
+    pending_tools: VecDeque<ToolCall>,
+    /// The tool call currently being executed (yielded to caller).
+    current_tool: Option<ToolCall>,
+
+    /// Events queued for emission (FIFO). Drained before advancing the FSM.
+    event_queue: VecDeque<Event>,
+
+    /// Steering messages — injected by caller at any time. Checked before
+    /// each tool execution and after each LLM response.
+    steering_queue: VecDeque<Message>,
+
+    /// Follow-up messages — only consumed when the loop would otherwise stop.
+    follow_up_queue: VecDeque<Message>,
+
+    /// Set by caller to abort the entire loop.
+    aborted: bool,
+
+    /// Consecutive transport errors (for retry logic).
+    consecutive_transport_errors: u32,
+    /// Max transport errors before giving up (0 = unlimited).
+    max_transport_errors: u32,
+}
+
+impl AgentLoop {
+    // ── Construction ─────────────────────────────────────────────────
+
+    pub fn new(state: AgentState, tool_schemas: Vec<ToolSchema>) -> Self {
+        Self {
+            state,
+            tool_schemas,
+            phase: Phase::Init,
+            pending_tools: VecDeque::new(),
+            current_tool: None,
+            event_queue: VecDeque::new(),
+            steering_queue: VecDeque::new(),
+            follow_up_queue: VecDeque::new(),
+            aborted: false,
+            consecutive_transport_errors: 0,
+            max_transport_errors: 3,
         }
     }
 
-    /// Interrupt the current turn with a message.
+    pub fn with_max_transport_errors(mut self, n: u32) -> Self {
+        self.max_transport_errors = n;
+        self
+    }
+
+    // ── Side-channel injection (callable at ANY time) ────────────────
+
+    /// Inject a steering message. Takes effect at the next interaction point:
+    /// remaining queued tool calls are skipped, and the message is appended
+    /// to the conversation before the next LLM call.
     pub fn steer(&mut self, msg: Message) {
-        self.steering.push_back(msg);
+        self.steering_queue.push_back(msg);
     }
 
-    /// Enqueue a message for after the current agent invocation finishes.
+    /// Inject a follow-up message. Only consumed when the loop would
+    /// otherwise finish (no tool calls, no steering).
     pub fn follow_up(&mut self, msg: Message) {
-        self.follow_up.push_back(msg);
+        self.follow_up_queue.push_back(msg);
     }
 
-    fn take_steering(&mut self) -> Option<Message> {
-        self.steering.pop_front()
+    /// Abort the entire loop. The next `resume_*` call will yield `Done(Aborted)`.
+    pub fn abort(&mut self) {
+        self.aborted = true;
     }
 
-    fn take_follow_up(&mut self) -> Option<Message> {
-        self.follow_up.pop_front()
+    // ── Read-only access to state ────────────────────────────────────
+
+    pub fn state(&self) -> &AgentState {
+        &self.state
     }
 
-    fn has_steering(&self) -> bool {
-        !self.steering.is_empty()
+    pub fn is_done(&self) -> bool {
+        matches!(self.phase, Phase::Done)
     }
 
-    fn has_follow_up(&self) -> bool {
-        !self.follow_up.is_empty()
+    // ── The driver protocol ──────────────────────────────────────────
+
+    /// Start the loop with initial user messages. Returns the first effect.
+    pub fn start(&mut self, messages: Vec<Message>) -> Effect {
+        self.state.messages.extend(messages);
+        self.state.turn = 0;
+        self.event_queue.push_back(Event::AgentStart);
+        self.begin_turn()
     }
-}
 
-// ---------------------------------------------------------------------------
-// 9. Context transform hook
-// ---------------------------------------------------------------------------
+    /// Resume after an `Effect::NeedLlm`. Provide the LLM response or error.
+    pub fn resume_llm(&mut self, result: Result<LlmResponse, TransportError>) -> Effect {
+        assert!(matches!(self.phase, Phase::WaitingForLlm));
 
-/// Called before each LLM call, allowing callers to compact, summarise, or
-/// otherwise transform the message history. This is where context-window
-/// management lives — outside the core loop.
-pub trait ContextTransform: Send {
-    fn transform(&self, system: &str, messages: &[Message]) -> (String, Vec<Message>);
-}
+        if self.aborted {
+            return self.finish(EndReason::Aborted);
+        }
 
-/// Identity transform — pass everything through unchanged.
-pub struct NoTransform;
-impl ContextTransform for NoTransform {
-    fn transform(&self, system: &str, messages: &[Message]) -> (String, Vec<Message>) {
-        (system.to_string(), messages.to_vec())
-    }
-}
+        match result {
+            Err(e) => {
+                self.consecutive_transport_errors += 1;
+                if self.max_transport_errors > 0
+                    && self.consecutive_transport_errors >= self.max_transport_errors
+                {
+                    return self.finish(EndReason::Error(format!(
+                        "transport failed {} times, last: {e}",
+                        self.consecutive_transport_errors
+                    )));
+                }
+                // Retry: yield another NeedLlm with the same state.
+                self.emit_need_llm()
+            }
+            Ok(resp) => {
+                self.consecutive_transport_errors = 0;
 
-// ---------------------------------------------------------------------------
-// 10. Agent configuration (builder)
-// ---------------------------------------------------------------------------
-
-pub struct AgentConfig {
-    pub tools: Vec<Box<dyn Tool>>,
-    pub transport: Box<dyn Transport>,
-    pub event_sink: Box<dyn EventSink>,
-    pub context_transform: Box<dyn ContextTransform>,
-    /// Max consecutive transport errors before giving up. 0 = unlimited.
-    pub max_transport_errors: u32,
-}
-
-// ---------------------------------------------------------------------------
-// 11. THE CORE LOOP
-// ---------------------------------------------------------------------------
-
-/// Run the agent loop synchronously.
-///
-/// This is the heart of the system: a plain `while` loop with no async, no
-/// executor, no hidden concurrency. The only blocking calls are inside
-/// `transport.send()` and `tool.execute()` — both are synchronous by contract.
-///
-/// ```text
-///  ┌────────────────────────────────────────────────────┐
-///  │                    OUTER LOOP                      │
-///  │  (continues while follow-up messages exist)        │
-///  │  ┌──────────────────────────────────────────────┐  │
-///  │  │               INNER LOOP                     │  │
-///  │  │  1. Send messages → LLM (via Transport)      │  │
-///  │  │  2. Collect tool calls from response          │  │
-///  │  │  3. Execute each tool (check steering/abort)  │  │
-///  │  │  4. Feed results back into messages           │  │
-///  │  │  5. If no tool calls → break inner loop       │  │
-///  │  └──────────────────────────────────────────────┘  │
-///  │  Check for follow-up messages; if any, continue    │
-///  └────────────────────────────────────────────────────┘
-/// ```
-pub fn agent_loop(
-    initial_messages: Vec<Message>,
-    state: &mut AgentState,
-    queues: &mut MessageQueues,
-    config: &AgentConfig,
-    abort: &AbortFlag,
-) -> AgentEndReason {
-    // Build tool schema table once.
-    let tool_schemas: Vec<ToolSchema> = config.tools.iter().map(|t| t.schema()).collect();
-    let tool_map: HashMap<&str, &dyn Tool> = config
-        .tools
-        .iter()
-        .map(|t| (t.schema().name.as_str(), t.as_ref()))
-        .collect();
-
-    // Append initial user messages.
-    state.messages.extend(initial_messages);
-
-    config.event_sink_emit(&Event::AgentStart);
-
-    let mut consecutive_errors: u32 = 0;
-
-    // ── OUTER LOOP ──────────────────────────────────────────────────────
-    'outer: loop {
-        state.turn += 1;
-        config.event_sink_emit(&Event::TurnStart { turn: state.turn });
-
-        // ── INNER LOOP ──────────────────────────────────────────────────
-        'inner: loop {
-            if abort.is_aborted() {
-                config.event_sink_emit(&Event::AgentEnd {
-                    reason: AgentEndReason::Aborted,
+                // Track tokens.
+                self.state.total_input_tokens += resp.input_tokens;
+                self.state.total_output_tokens += resp.output_tokens;
+                self.event_queue.push_back(Event::TokenUsage {
+                    input: resp.input_tokens,
+                    output: resp.output_tokens,
                 });
-                return AgentEndReason::Aborted;
+
+                // Record assistant message.
+                self.event_queue.push_back(Event::AssistantMessage {
+                    message: resp.message.clone(),
+                });
+                let tool_calls: Vec<ToolCall> = resp.message.tool_calls().cloned().collect();
+                self.state.messages.push(resp.message);
+
+                if resp.stop_reason == StopReason::Error {
+                    return self.end_turn_and_maybe_continue();
+                }
+
+                if tool_calls.is_empty() {
+                    // Model is done for this turn — no tools to run.
+                    self.end_turn_and_maybe_continue()
+                } else {
+                    // Queue up tool calls.
+                    self.pending_tools = tool_calls.into();
+                    self.advance_to_next_tool()
+                }
             }
+        }
+    }
 
-            // 1. Optional context transform (compaction, summarisation).
-            let (sys, msgs) = config
-                .context_transform
-                .transform(&state.system_prompt, &state.messages);
+    /// Resume after an `Effect::NeedToolExec`. Provide the execution result.
+    pub fn resume_tool(&mut self, result: ToolExecResult) -> Effect {
+        assert!(matches!(self.phase, Phase::WaitingForTool));
 
-            // 2. Call the LLM.
-            let response = match config.transport.send(&sys, &msgs, &tool_schemas, abort) {
-                Ok(r) => {
-                    consecutive_errors = 0;
-                    r
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    if config.max_transport_errors > 0
-                        && consecutive_errors >= config.max_transport_errors
-                    {
-                        let reason = AgentEndReason::Error(format!(
-                            "transport failed {consecutive_errors} times: {e}"
-                        ));
-                        config.event_sink_emit(&Event::AgentEnd {
-                            reason: AgentEndReason::Error(e.to_string()),
-                        });
-                        return reason;
-                    }
-                    // Retry: just loop again. Callers can implement backoff
-                    // in the Transport itself.
-                    continue 'inner;
-                }
-            };
+        let tc = self.current_tool.take().expect("no current tool call");
 
-            // Track tokens.
-            state.total_input_tokens += response.input_tokens;
-            state.total_output_tokens += response.output_tokens;
-            config.event_sink_emit(&Event::TokenUsage {
-                input: response.input_tokens,
-                output: response.output_tokens,
+        if self.aborted {
+            // Still record the result, then bail.
+            self.push_tool_result(&tc, result);
+            self.skip_remaining_tools();
+            return self.finish(EndReason::Aborted);
+        }
+
+        // Record the result.
+        let tool_result = ToolResult {
+            tool_call_id: tc.id.clone(),
+            content: result.content,
+            is_error: result.is_error,
+        };
+        self.event_queue.push_back(Event::ToolExecEnd {
+            call_id: tc.id.clone(),
+            result: tool_result.clone(),
+        });
+        self.state.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult(tool_result)],
+        });
+
+        // Advance to next tool (or next LLM call).
+        self.advance_to_next_tool()
+    }
+
+    /// Resume after an `Effect::Event`. No data needed — just acknowledgement
+    /// that the caller processed the event (updated UI, etc.).
+    pub fn resume(&mut self) -> Effect {
+        assert!(matches!(self.phase, Phase::WaitingForEventAck));
+        self.drain_or_advance()
+    }
+
+    // ── Internal state machine logic ─────────────────────────────────
+
+    /// Drain queued events first; if none, advance the FSM.
+    fn drain_or_advance(&mut self) -> Effect {
+        // Always drain events before yielding an I/O effect.
+        if let Some(event) = self.event_queue.pop_front() {
+            self.phase = Phase::WaitingForEventAck;
+            return Effect::Event(event);
+        }
+
+        // No events — advance based on current phase.
+        match &self.phase {
+            Phase::Init => self.emit_need_llm(),
+            Phase::WaitingForEventAck => {
+                // We were draining events. Now figure out what to actually do.
+                // This shouldn't happen if drain logic is correct, but handle
+                // it gracefully by emitting NeedLlm.
+                self.emit_need_llm()
+            }
+            Phase::Done => Effect::Done(EndReason::Done),
+            _ => unreachable!("drain_or_advance called in unexpected phase"),
+        }
+    }
+
+    fn begin_turn(&mut self) -> Effect {
+        self.state.turn += 1;
+        self.event_queue
+            .push_back(Event::TurnStart { turn: self.state.turn });
+        self.phase = Phase::Init;
+        self.drain_or_advance()
+    }
+
+    fn emit_need_llm(&mut self) -> Effect {
+        // First drain any pending events.
+        if let Some(event) = self.event_queue.pop_front() {
+            self.phase = Phase::WaitingForEventAck;
+            return Effect::Event(event);
+        }
+
+        self.phase = Phase::WaitingForLlm;
+        Effect::NeedLlm(LlmRequest {
+            system_prompt: self.state.system_prompt.clone(),
+            messages: self.state.messages.clone(),
+            tools: self.tool_schemas.clone(),
+        })
+    }
+
+    fn advance_to_next_tool(&mut self) -> Effect {
+        // Drain events first (e.g. ToolExecEnd from previous tool).
+        if let Some(event) = self.event_queue.pop_front() {
+            self.phase = Phase::WaitingForEventAck;
+            return Effect::Event(event);
+        }
+
+        // Check for abort.
+        if self.aborted {
+            self.skip_remaining_tools();
+            return self.finish(EndReason::Aborted);
+        }
+
+        // Check for steering — skip remaining tools if steered.
+        if let Some(steer_msg) = self.steering_queue.pop_front() {
+            self.event_queue.push_back(Event::Steered {
+                message: steer_msg.clone(),
             });
+            self.state.messages.push(steer_msg);
+            self.skip_remaining_tools();
+            // After steering, go back to the LLM with the new context.
+            return self.drain_or_advance_to_llm();
+        }
 
-            // 3. Record assistant message.
-            config.event_sink_emit(&Event::AssistantMessage {
-                message: response.message.clone(),
-            });
-            state.messages.push(response.message.clone());
-
-            // 4. Extract tool calls.
-            let tool_calls = response.message.tool_calls();
-
-            if tool_calls.is_empty() {
-                // No tool calls → this turn is done.
-                break 'inner;
-            }
-
-            if response.stop_reason == StopReason::Error
-                || response.stop_reason == StopReason::Aborted
-            {
-                break 'inner;
-            }
-
-            // 5. Execute tool calls, respecting steering/abort.
-            let mut steered = false;
-            for tc in &tool_calls {
-                // Check for steering message before each tool.
-                if let Some(steer_msg) = queues.take_steering() {
-                    config.event_sink_emit(&Event::Steered {
-                        message: steer_msg.clone(),
-                    });
-                    state.messages.push(steer_msg);
-                    steered = true;
-
-                    // Skip remaining tools — push error results for unskipped.
-                    push_skipped_tool_result(state, tc);
-                    continue;
-                }
-
-                if steered {
-                    push_skipped_tool_result(state, tc);
-                    continue;
-                }
-
-                if abort.is_aborted() {
-                    push_skipped_tool_result(state, tc);
-                    continue;
-                }
-
-                config.event_sink_emit(&Event::ToolExecStart {
+        // Pop next tool call.
+        match self.pending_tools.pop_front() {
+            Some(tc) => {
+                self.event_queue.push_back(Event::ToolExecStart {
                     call_id: tc.id.clone(),
                     name: tc.name.clone(),
                 });
+                self.current_tool = Some(tc.clone());
 
-                let result = match tool_map.get(tc.name.as_str()) {
-                    Some(tool) => tool.execute(&tc.id, &tc.arguments, abort),
-                    None => ToolExecResult::error(format!("unknown tool: {}", tc.name)),
-                };
+                // Drain the ToolExecStart event first.
+                if let Some(event) = self.event_queue.pop_front() {
+                    self.phase = Phase::WaitingForEventAck;
+                    return Effect::Event(event);
+                }
 
-                let tool_result = ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: result.content,
-                    is_error: result.is_error,
-                };
-
-                config.event_sink_emit(&Event::ToolExecEnd {
-                    call_id: tc.id.clone(),
-                    result: tool_result.clone(),
-                });
-
-                // Feed result back into conversation.
-                state.messages.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::ToolResult(tool_result)],
-                });
+                self.phase = Phase::WaitingForTool;
+                Effect::NeedToolExec(ToolCallRequest {
+                    call_id: tc.id,
+                    name: tc.name,
+                    arguments: tc.arguments,
+                })
             }
-
-            // Continue inner loop — the LLM will see tool results next turn.
+            None => {
+                // All tools done — loop back to LLM for the next turn.
+                self.emit_need_llm()
+            }
         }
-        // ── END INNER LOOP ──────────────────────────────────────────────
-
-        config.event_sink_emit(&Event::TurnEnd { turn: state.turn });
-
-        // Check for follow-up messages before declaring done.
-        if let Some(follow_up) = queues.take_follow_up() {
-            state.messages.push(follow_up);
-            continue 'outer;
-        }
-
-        // Also check steering queue (could have arrived during last tool exec).
-        if let Some(steer_msg) = queues.take_steering() {
-            state.messages.push(steer_msg);
-            continue 'outer;
-        }
-
-        // Nothing left — we're done.
-        config.event_sink_emit(&Event::AgentEnd {
-            reason: AgentEndReason::Done,
-        });
-        return AgentEndReason::Done;
     }
-}
 
-/// Helper: push a "skipped" tool result so the LLM knows the tool wasn't run.
-fn push_skipped_tool_result(state: &mut AgentState, tc: &ToolCall) {
-    state.messages.push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult(ToolResult {
+    /// After draining events (like Steered), proceed to the LLM call.
+    fn drain_or_advance_to_llm(&mut self) -> Effect {
+        if let Some(event) = self.event_queue.pop_front() {
+            self.phase = Phase::WaitingForEventAck;
+            return Effect::Event(event);
+        }
+        self.emit_need_llm()
+    }
+
+    fn end_turn_and_maybe_continue(&mut self) -> Effect {
+        self.event_queue
+            .push_back(Event::TurnEnd { turn: self.state.turn });
+
+        // Check follow-up / steering before declaring done.
+        if let Some(steer_msg) = self.steering_queue.pop_front() {
+            self.state.messages.push(steer_msg);
+            return self.begin_turn_after_events();
+        }
+
+        if let Some(follow_up) = self.follow_up_queue.pop_front() {
+            self.state.messages.push(follow_up);
+            return self.begin_turn_after_events();
+        }
+
+        // Truly done.
+        self.finish(EndReason::Done)
+    }
+
+    fn begin_turn_after_events(&mut self) -> Effect {
+        // Drain pending events (like TurnEnd), then start new turn.
+        if let Some(event) = self.event_queue.pop_front() {
+            // After draining, we need to remember to begin a new turn.
+            // We use Init phase + pending events to handle this.
+            self.phase = Phase::WaitingForEventAck;
+            return Effect::Event(event);
+        }
+        self.begin_turn()
+    }
+
+    fn finish(&mut self, reason: EndReason) -> Effect {
+        self.phase = Phase::Done;
+        Effect::Done(reason)
+    }
+
+    fn skip_remaining_tools(&mut self) {
+        while let Some(tc) = self.pending_tools.pop_front() {
+            self.state.messages.push(Message::tool_result(
+                &tc.id,
+                vec![ContentBlock::Text("Skipped (interrupted)".into())],
+                true,
+            ));
+        }
+    }
+
+    fn push_tool_result(&mut self, tc: &ToolCall, result: ToolExecResult) {
+        let tool_result = ToolResult {
             tool_call_id: tc.id.clone(),
-            content: vec![ContentBlock::Text(
-                "Tool execution skipped (steering message or abort)".into(),
-            )],
-            is_error: true,
-        })],
-    });
-}
-
-// Convenience method to avoid borrow-checker friction with &mut event_sink.
-impl AgentConfig {
-    fn event_sink_emit(&self, _event: &Event) {
-        // In production: self.event_sink.on_event(event)
-        // Sketched as no-op because `&self` vs `&mut self` on event_sink
-        // needs interior mutability (RefCell/Mutex). See note below.
+            content: result.content,
+            is_error: result.is_error,
+        };
+        self.state.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult(tool_result)],
+        });
     }
 }
 
-// ---------------------------------------------------------------------------
-// 12. Extension semantics — how to add capabilities
-// ---------------------------------------------------------------------------
-
-// The extension surface is deliberately minimal. There are exactly three
-// extension points, each a trait:
+// ═══════════════════════════════════════════════════════════════════════
+// PART 6: Convenience driver — `run_blocking`
+// ═══════════════════════════════════════════════════════════════════════
 //
-// ┌─────────────────────────────────────────────────────────────────┐
-// │  Extension Point    │ Trait           │ Purpose                 │
-// ├─────────────────────┼─────────────────┼─────────────────────────┤
-// │  What the model     │ Tool            │ New capabilities        │
-// │  can do             │                 │ (bash, read, write, …)  │
-// ├─────────────────────┼─────────────────┼─────────────────────────┤
-// │  How the model is   │ Transport       │ Provider, retry, cache  │
-// │  called             │                 │                         │
-// ├─────────────────────┼─────────────────┼─────────────────────────┤
-// │  What the caller    │ EventSink       │ TUI, logging, metrics   │
-// │  sees               │                 │                         │
-// ├─────────────────────┼─────────────────┼─────────────────────────┤
-// │  Context management │ ContextTransform│ Compaction, summarise   │
-// │                     │                 │                         │
-// └─────────────────────┴─────────────────┴─────────────────────────┘
-//
-// Everything else (session persistence, branching, UI, skills) is built
-// *on top* of these primitives. The core loop doesn't know about any of it.
+// For callers who don't need fine-grained control, this function drives
+// the loop synchronously, like v1. It's 20 lines on top of the FSM.
 
-// ---------------------------------------------------------------------------
-// 13. Example: a minimal tool implementation
-// ---------------------------------------------------------------------------
+/// Trait for tools used with `run_blocking`.
+pub trait Tool: Send {
+    fn schema(&self) -> ToolSchema;
+    fn execute(&self, call_id: &str, arguments: &str) -> ToolExecResult;
+}
 
-/// Example: a tool that reads a file from disk.
-pub struct ReadFileTool;
+/// Simple blocking driver. Handles I/O, dispatches tools, logs events.
+pub fn run_blocking(
+    messages: Vec<Message>,
+    state: AgentState,
+    tools: &[&dyn Tool],
+    transport: &dyn Fn(&LlmRequest) -> Result<LlmResponse, TransportError>,
+    on_event: &mut dyn FnMut(&Event),
+) -> (AgentState, EndReason) {
+    let schemas = tools.iter().map(|t| t.schema()).collect::<Vec<_>>();
+    let tool_map: std::collections::HashMap<&str, &dyn Tool> = tools
+        .iter()
+        .map(|t| (t.schema().name.as_str(), *t))
+        .collect();
 
-impl Tool for ReadFileTool {
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "read".into(),
-            description: "Read a file from disk".into(),
-            parameters_schema: r#"{
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Absolute file path" }
-                },
-                "required": ["path"]
-            }"#
-            .into(),
-        }
-    }
+    let mut agent = AgentLoop::new(state, schemas);
+    let mut effect = agent.start(messages);
 
-    fn execute(&self, _call_id: &str, arguments: &str, _abort: &AbortFlag) -> ToolExecResult {
-        // In production: parse JSON, validate, read file, handle errors.
-        // Sketch:
-        let path = arguments; // pretend we parsed it
-        match std::fs::read_to_string(path) {
-            Ok(content) => ToolExecResult::text(content),
-            Err(e) => ToolExecResult::error(format!("failed to read {path}: {e}")),
+    loop {
+        match effect {
+            Effect::Event(ref ev) => {
+                on_event(ev);
+                effect = agent.resume();
+            }
+            Effect::NeedLlm(ref req) => {
+                let result = transport(req);
+                effect = agent.resume_llm(result);
+            }
+            Effect::NeedToolExec(ref req) => {
+                let result = match tool_map.get(req.name.as_str()) {
+                    Some(tool) => tool.execute(&req.call_id, &req.arguments),
+                    None => ToolExecResult::error(format!("unknown tool: {}", req.name)),
+                };
+                effect = agent.resume_tool(result);
+            }
+            Effect::Done(reason) => {
+                // Move state out of the loop.
+                return (agent.state.clone(), reason);
+            }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// 14. Example: composing an event sink
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+// PART 7: Example — TUI driver with non-blocking tool execution
+// ═══════════════════════════════════════════════════════════════════════
+//
+// This shows the *power* of the cooperative design: the caller can run
+// tools in background threads, pump the UI at 60fps, and handle user
+// interrupts — all without async.
 
-/// Sink that writes a structured log line for every event.
-pub struct LogSink;
+#[cfg(never)]
+mod tui_example {
+    use super::*;
+    use std::time::Duration;
 
-impl EventSink for LogSink {
-    fn on_event(&mut self, event: &Event) {
-        eprintln!("[agent] {event:?}");
+    fn run_tui_agent(
+        messages: Vec<Message>,
+        state: AgentState,
+        tools: &[&dyn Tool],
+        transport: &dyn Fn(&LlmRequest) -> Result<LlmResponse, TransportError>,
+        ui: &mut dyn TuiBackend,
+    ) -> (AgentState, EndReason) {
+        let schemas = tools.iter().map(|t| t.schema()).collect::<Vec<_>>();
+        let tool_map: std::collections::HashMap<String, &dyn Tool> = tools
+            .iter()
+            .map(|t| (t.schema().name.clone(), *t))
+            .collect();
+
+        let mut agent = AgentLoop::new(state, schemas);
+        let mut effect = agent.start(messages);
+
+        loop {
+            match effect {
+                Effect::Event(ref ev) => {
+                    ui.handle_event(ev);
+                    ui.render();
+                    effect = agent.resume();
+                }
+
+                Effect::NeedLlm(ref req) => {
+                    // Start LLM call in background thread.
+                    let req_clone = req.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = todo!("call LLM");
+                        let _ = tx.send(result);
+                    });
+
+                    // While waiting: pump UI, check for user input.
+                    let result = loop {
+                        // Check if LLM responded.
+                        if let Ok(r) = rx.try_recv() {
+                            break r;
+                        }
+
+                        // Poll user input — they might type a steering message.
+                        if let Some(input) = ui.poll_input(Duration::from_millis(16)) {
+                            match input {
+                                UserInput::Abort => {
+                                    agent.abort();
+                                    // Still need to wait for the LLM call to finish
+                                    // (or the transport to notice the abort).
+                                    break rx.recv().unwrap();
+                                }
+                                UserInput::Message(text) => {
+                                    agent.steer(Message::user(text));
+                                }
+                            }
+                        }
+
+                        // Render at ~60fps.
+                        ui.render();
+                    };
+
+                    effect = agent.resume_llm(result);
+                }
+
+                Effect::NeedToolExec(ref req) => {
+                    let tool = tool_map[req.name.as_str()];
+                    let call_id = req.call_id.clone();
+                    let args = req.arguments.clone();
+
+                    // Run tool in background.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = tool.execute(&call_id, &args);
+                        let _ = tx.send(result);
+                    });
+
+                    // While waiting: pump UI, check for interrupts.
+                    let result = loop {
+                        if let Ok(r) = rx.try_recv() {
+                            break r;
+                        }
+                        if let Some(UserInput::Abort) = ui.poll_input(Duration::from_millis(16)) {
+                            agent.abort();
+                            break rx.recv().unwrap();
+                        }
+                        ui.render();
+                    };
+
+                    effect = agent.resume_tool(result);
+                }
+
+                Effect::Done(reason) => {
+                    return (agent.state.clone(), reason);
+                }
+            }
+        }
+    }
+
+    // Placeholder traits for the TUI example.
+    enum UserInput {
+        Abort,
+        Message(String),
+    }
+
+    trait TuiBackend {
+        fn handle_event(&mut self, event: &Event);
+        fn render(&mut self);
+        fn poll_input(&mut self, timeout: Duration) -> Option<UserInput>;
     }
 }
 
-/// Combine multiple sinks.
-pub struct CompositeSink(Vec<Box<dyn EventSink>>);
+// ═══════════════════════════════════════════════════════════════════════
+// PART 8: Example — async driver (bridge to tokio)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The core loop is sync, but integrating with async is trivial: spawn
+// the I/O as async tasks and await them in the driver.
 
-impl EventSink for CompositeSink {
-    fn on_event(&mut self, event: &Event) {
-        for sink in &mut self.0 {
-            sink.on_event(event);
+#[cfg(never)]
+mod async_example {
+    use super::*;
+
+    async fn run_async_agent(
+        messages: Vec<Message>,
+        state: AgentState,
+        schemas: Vec<ToolSchema>,
+    ) -> (AgentState, EndReason) {
+        let mut agent = AgentLoop::new(state, schemas);
+        let mut effect = agent.start(messages);
+
+        loop {
+            match effect {
+                Effect::Event(ref _ev) => {
+                    // Handle event (log, websocket push, etc.)
+                    effect = agent.resume();
+                }
+                Effect::NeedLlm(ref req) => {
+                    // Use an async HTTP client.
+                    let result = todo!("async_llm_call(req).await");
+                    effect = agent.resume_llm(result);
+                }
+                Effect::NeedToolExec(ref req) => {
+                    // Use tokio::task::spawn_blocking for CPU-bound tools,
+                    // or just await async tools directly.
+                    let result = todo!("async_tool_exec(req).await");
+                    effect = agent.resume_tool(result);
+                }
+                Effect::Done(reason) => {
+                    return (agent.state.clone(), reason);
+                }
+            }
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// 15. Example: putting it all together
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+// PART 9: Extension semantics
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The v2 design has *fewer* built-in extension points than v1 because the
+// cooperative model pushes most concerns to the driver:
+//
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │ Concern             │ v1 (blocking)       │ v2 (cooperative)       │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Tool dispatch       │ Tool trait objects   │ Caller's problem.      │
+// │                     │ inside the loop      │ Loop yields requests.  │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Transport           │ Transport trait      │ Caller's problem.      │
+// │                     │ inside the loop      │ Loop yields requests.  │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Event handling      │ EventSink trait      │ Caller handles Effect  │
+// │                     │                     │ ::Event directly.      │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Context transform   │ ContextTransform    │ Caller mutates the     │
+// │                     │ trait               │ LlmRequest before      │
+// │                     │                     │ sending. No trait.     │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Streaming tokens    │ Not possible (loop  │ Caller streams while   │
+// │                     │ blocks in send())   │ holding NeedLlm.       │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ UI updates          │ Via EventSink only   │ At every yield point.  │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Interrupts          │ AbortFlag + steering │ steer()/abort() at     │
+// │                     │ (racy)              │ any yield point (safe). │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Parallel tools      │ Not supported        │ Caller spawns threads  │
+// │                     │                     │ while holding NeedTool.│
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Retry/backoff       │ In Transport impl    │ Caller retries before  │
+// │                     │                     │ calling resume_llm().  │
+// ├─────────────────────┼─────────────────────┼────────────────────────┤
+// │ Session branching   │ Clone AgentState     │ Clone AgentState.      │
+// │                     │                     │ (same as v1)           │
+// └─────────────────────┴─────────────────────┴────────────────────────┘
+//
+// Key insight: the cooperative design REMOVES built-in extension traits
+// (Transport, EventSink, ContextTransform) and replaces them with
+// interaction points. This is *more* extensible because:
+//
+//   1. No trait object overhead or dynamic dispatch.
+//   2. Callers can compose behaviors freely (retry + cache + log)
+//      without wrapper-trait towers.
+//   3. The core has zero dependencies beyond std.
+//   4. Testing is trivial — feed canned Effects, assert on Resumes.
+//
+// The only extension surface the core provides is:
+//   - Tool schemas (what capabilities to advertise to the model)
+//   - steer() / follow_up() / abort() (injecting user intent)
+//
+// Everything else is the driver's responsibility.
 
-#[cfg(never)] // conceptual — won't compile without a real Transport impl
-fn example_usage() {
-    let mut state = AgentState::new("You are a helpful coding assistant.");
-    let mut queues = MessageQueues::new();
-    let abort = AbortFlag::new();
-
-    let config = AgentConfig {
-        tools: vec![Box::new(ReadFileTool)],
-        transport: todo!("provide an impl"),
-        event_sink: Box::new(LogSink),
-        context_transform: Box::new(NoTransform),
-        max_transport_errors: 3,
-    };
-
-    let reason = agent_loop(
-        vec![Message::user("Read the file at /tmp/hello.txt and summarise it.")],
-        &mut state,
-        &mut queues,
-        &config,
-        &abort,
-    );
-
-    match reason {
-        AgentEndReason::Done => println!("Agent finished."),
-        AgentEndReason::Aborted => println!("Agent was aborted."),
-        AgentEndReason::Error(e) => eprintln!("Agent error: {e}"),
-    }
-
-    // State can be serialised and restored for session persistence.
-    println!("Tokens used: {} in, {} out", state.total_input_tokens, state.total_output_tokens);
-}
-
-// ---------------------------------------------------------------------------
-// 16. Design notes
-// ---------------------------------------------------------------------------
-
-// WHY NO ASYNC IN THE CORE LOOP?
+// ═══════════════════════════════════════════════════════════════════════
+// PART 10: Design notes
+// ═══════════════════════════════════════════════════════════════════════
 //
-// The core loop is a state machine driven by two blocking operations:
-// Transport::send() and Tool::execute(). Making these async would:
-//   - Force every tool author to deal with async (Pin, Send, lifetime soup).
-//   - Require an executor in scope — coupling the core to tokio/smol/etc.
-//   - Gain almost nothing: the loop is fundamentally sequential. The model
-//     responds, we execute tools one by one, repeat. There's no useful
-//     concurrency to exploit *within* a single turn.
+// THE EFFECT PATTERN (aka "algebraic effects", "free monad", "command pattern")
 //
-// If callers need to run the loop off the main thread or integrate with an
-// async runtime, they spawn a thread:
+// The core idea: separate *describing* what to do from *doing* it.
+// The loop is a pure function: (State, Input) → (State, Effect).
+// The driver is the interpreter that gives meaning to effects.
 //
-//   std::thread::spawn(move || agent_loop(msgs, &mut state, ...));
+// This pattern is well-established in:
+//   - Elm's Cmd/Sub model
+//   - Redux-saga's effects
+//   - Haskell's free monads
+//   - Game engines' command buffers
 //
-// Or use `spawn_blocking` in tokio. The core stays simple.
+// In Rust, it maps naturally to enums + match, with no special language
+// support needed. No Pin, no Future, no async, no trait objects in the
+// core — just enums and structs.
 //
 //
-// PARALLEL TOOL EXECUTION (optional, outside core):
+// WHY EVENTS ARE IN THE EFFECT ENUM (not a separate channel):
 //
-// When the model emits N tool calls, pi executes them sequentially (with
-// steering checks between each). If you want parallel tool execution, wrap
-// tools in a `ParallelToolExecutor` that spawns threads internally but
-// presents a synchronous interface to the loop. This keeps the core simple
-// while allowing callers to opt into concurrency.
+// Events are yielded as `Effect::Event` rather than collected in a Vec
+// because:
+//   1. The caller gets to process each event *before* the loop advances.
+//      This guarantees UI consistency — you never miss a state transition.
+//   2. Backpressure is natural: the loop won't flood the caller with
+//      events faster than it can handle them.
+//   3. No interior mutability or channels needed.
+//   4. The caller can trivially skip events: just call resume() immediately.
 //
+// If event-per-yield is too chatty, callers can batch:
 //
-// EVENT SINK & INTERIOR MUTABILITY:
-//
-// The EventSink takes `&mut self` for simplicity, but the core loop holds
-// AgentConfig by `&`. In production, use one of:
-//   - `RefCell<Box<dyn EventSink>>` (single-threaded)
-//   - `Mutex<Box<dyn EventSink>>` (multi-threaded)
-//   - A channel-based sink that takes `&self` (no mutation needed)
-//
-// The channel approach is cleanest: `impl EventSink for mpsc::Sender<Event>`.
-//
-//
-// EXTENSION SEMANTICS — WHY TRAITS, NOT CLOSURES:
-//
-// Traits over closures for Tool/Transport/EventSink because:
-//   1. Named types are self-documenting and testable.
-//   2. Trait objects compose (CompositeSink, FallbackTransport).
-//   3. Schema introspection (Tool::schema()) doesn't fit closures naturally.
-//   4. Downstream crates can implement traits without depending on our crate's
-//      closure signatures.
-//
-// Closures are still useful for one-off tools in tests:
-//
-//   struct FnTool<F: Fn(&str, &str, &AbortFlag) -> ToolExecResult> {
-//       name: String,
-//       schema: ToolSchema,
-//       f: F,
+//   loop {
+//       match effect {
+//           Effect::Event(ev) => {
+//               events.push(ev);
+//               effect = agent.resume();  // immediately get next
+//               continue;                 // batch until non-event
+//           }
+//           _ => {
+//               process_batched_events(&events);
+//               events.clear();
+//               // handle the non-event effect...
+//           }
+//       }
 //   }
 //
 //
-// SESSION BRANCHING:
+// COMPARISON WITH ASYNC:
 //
-// Since AgentState is Clone, branching is trivial:
+// An async version of this same design would use `async fn` + `.await`
+// instead of yield/resume:
 //
-//   let branch = state.clone();
-//   agent_loop(side_quest_msgs, &mut branch, ...);
-//   // branch diverges; original state is unchanged.
+//   async fn agent_loop(state, tools, transport) {
+//       loop {
+//           let resp = transport.send(&request).await;  // <-- yield point
+//           for tc in resp.tool_calls() {
+//               let result = tools.execute(tc).await;   // <-- yield point
+//           }
+//       }
+//   }
 //
-// This mirrors pi's session tree model.
+// The cooperative design achieves the same yield points without async.
+// Advantages over async:
+//   - No executor dependency (works in no_std, embedded, WASM, etc.)
+//   - No Send/Sync/Pin constraints propagating through the entire stack
+//   - Easier to test (no need to mock async boundaries)
+//   - State is always accessible (no borrow-across-await issues)
+//   - The driver can be async OR sync — caller's choice
+//
+// Disadvantage:
+//   - More boilerplate in the driver (the match loop).
+//     Mitigated by run_blocking() convenience function.
 
 fn main() {
-    // This file is a design proposal, not a runnable binary.
     println!("See the code and comments above for the proposed architecture.");
 }
