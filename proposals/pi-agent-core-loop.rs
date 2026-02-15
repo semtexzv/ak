@@ -1,11 +1,15 @@
 // =============================================================================
-// Pi Agent Core Loop — Rust Proposal (v2: Cooperative State Machine)
+// Pi Agent Core Loop — Rust Proposal (v3: Cooperative FSM + Hooks)
 // =============================================================================
 //
-// Revision of the original blocking-loop design. The core loop is now a
-// **cooperative state machine** that never blocks. It yields `Effect` values
-// at every I/O boundary — the caller (the "driver") performs the actual I/O,
-// updates the UI, checks for interrupts, and feeds results back.
+// The core loop is a **cooperative state machine** that never blocks. It yields
+// `Effect` values at every I/O boundary — the caller (the "driver") performs
+// the actual I/O and feeds results back.
+//
+// **Hooks** are extension points passed to every resume_*() call. The agent
+// calls hooks internally — the driver just passes them through. This keeps
+// the driver trivially simple (just I/O) while allowing powerful extension
+// at every interaction point.
 //
 // This gives the caller full control over:
 //   - When and how I/O happens (sync, async, threaded, polled)
@@ -17,24 +21,35 @@
 // The core loop itself: zero I/O, zero blocking, zero async, zero threads.
 // Pure data in → data out.
 //
-// ┌─────────────────────────────────────────────────────────────────────┐
-// │                         ARCHITECTURE                               │
-// │                                                                    │
-// │   ┌──────────────┐  Effect   ┌──────────────┐                     │
-// │   │              │ ────────> │              │                     │
-// │   │  AgentLoop   │           │    Driver    │  ← caller code      │
-// │   │  (pure FSM)  │ <──────── │  (your code) │                     │
-// │   │              │  Resume   │              │                     │
-// │   └──────────────┘           └──────┬───────┘                     │
-// │         │                           │                             │
-// │         │ state                     │ performs I/O, UI, etc.      │
-// │         ▼                           ▼                             │
-// │   ┌──────────────┐           ┌──────────────┐                     │
-// │   │  AgentState   │           │  Transport   │                     │
-// │   │  (serialise)  │           │  Tools       │                     │
-// │   └──────────────┘           │  TUI/GUI     │                     │
-// │                              └──────────────┘                     │
-// └─────────────────────────────────────────────────────────────────────┘
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │                           ARCHITECTURE                                  │
+// │                                                                        │
+// │   ┌───────────────────────────────────┐                                │
+// │   │          AgentLoop (FSM)          │                                │
+// │   │                                   │                                │
+// │   │  On every resume_*() call:        │                                │
+// │   │    1. Process input (LLM response, │       ┌──────────────┐        │
+// │   │       tool result, event ack)     │       │              │        │
+// │   │    2. Call hooks internally ───────┤──────>│  &mut Hooks  │        │
+// │   │       (before_llm, before_tool,   │<──────│  (borrowed)  │        │
+// │   │        after_tool, etc.)          │       │              │        │
+// │   │    3. Handle hook results         │       └──────────────┘        │
+// │   │       (Block → error result,      │        hooks own their state   │
+// │   │        Replace → use cached, etc.)│                                │
+// │   │    4. Yield next Effect           │                                │
+// │   │                                   │                                │
+// │   └─────────┬─────────────────────────┘                                │
+// │      Effect │ ▲ Resume                                                 │
+// │             ▼ │                                                        │
+// │   ┌───────────────────────────────────┐                                │
+// │   │     Driver (your code — just I/O) │                                │
+// │   │                                   │                                │
+// │   │  NeedLlm(req) → call transport    │                                │
+// │   │  NeedToolExec(req) → run tool     │                                │
+// │   │  Event(ev) → update UI/log        │                                │
+// │   │  Done(reason) → break             │                                │
+// │   └───────────────────────────────────┘                                │
+// └─────────────────────────────────────────────────────────────────────────┘
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -275,6 +290,100 @@ impl AgentState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// PART 4b: Hooks — extension points passed on every step
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Hooks are NOT stored by the AgentLoop. They're borrowed on every
+// resume_*() call. The agent calls them internally at the right points
+// and handles the results (blocked tools, replaced results) itself.
+//
+// The driver just passes hooks through — it doesn't need to know what
+// they do. This keeps the driver trivially simple.
+//
+//   // Driver loop — hooks are opaque, just passed through:
+//   loop {
+//       match effect {
+//           Effect::NeedLlm(req) => {
+//               let result = transport(&req);
+//               effect = agent.resume_llm(result, &mut hooks);
+//           }
+//           Effect::NeedToolExec(req) => {
+//               let result = execute(&req);
+//               effect = agent.resume_tool(result, &mut hooks);
+//           }
+//           ...
+//       }
+//   }
+//
+// Hooks own their state themselves. The agent doesn't care.
+
+/// What a hook wants to do with a tool call.
+#[derive(Debug)]
+pub enum ToolAction {
+    /// Let it through — execute normally.
+    Continue,
+    /// Block execution. The agent handles it internally: creates an
+    /// error result, records it, moves to the next tool. The driver
+    /// never sees this tool call.
+    Block { reason: String },
+    /// Short-circuit with this result. The actual tool never runs.
+    /// The driver never sees this tool call.
+    Replace(ToolExecResult),
+}
+
+/// The extension point. Passed to every `resume_*()` call. The agent
+/// calls these methods internally at the right points.
+///
+/// All methods have default no-op implementations, so hooks only
+/// override what they care about. Use `NoHooks` for zero overhead.
+pub trait Hooks {
+    /// Called before each LLM request is built and yielded.
+    /// Can mutate the request (add system context, rewrite messages,
+    /// change tool schemas, etc.). This is the "context transform" hook.
+    fn before_llm(&mut self, _req: &mut LlmRequest, _state: &AgentState) {}
+
+    /// Called after the LLM response arrives, before the agent processes it.
+    /// Can inspect or mutate the response.
+    fn after_llm(
+        &mut self,
+        _resp: &mut LlmResponse,
+        _state: &AgentState,
+    ) {}
+
+    /// Called before each tool executes. Can:
+    /// - `Continue`: execute normally (driver handles it)
+    /// - `Block { reason }`: reject. Agent records error, moves on.
+    /// - `Replace(result)`: skip execution, use this result instead.
+    ///
+    /// The request is mutable — hooks can rewrite arguments.
+    /// If the hook returns Block or Replace, the driver never sees
+    /// this tool call. The agent handles it internally.
+    fn before_tool(
+        &mut self,
+        _req: &mut ToolCallRequest,
+        _state: &AgentState,
+    ) -> ToolAction {
+        ToolAction::Continue
+    }
+
+    /// Called after a tool executes. Can mutate the result before
+    /// the agent records it.
+    fn after_tool(
+        &mut self,
+        _req: &ToolCallRequest,
+        _result: &mut ToolExecResult,
+        _state: &AgentState,
+    ) {}
+
+    /// Called for every event the agent emits (before yielding it).
+    fn on_event(&mut self, _event: &Event, _state: &AgentState) {}
+}
+
+/// Zero-cost no-op hooks. All calls inline to nothing.
+pub struct NoHooks;
+impl Hooks for NoHooks {}
+
+// ═══════════════════════════════════════════════════════════════════════
 // PART 5: The state machine — the actual core loop
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -377,17 +486,28 @@ impl AgentLoop {
     }
 
     // ── The driver protocol ──────────────────────────────────────────
+    //
+    // Every method takes `&mut impl Hooks`. The agent calls hooks
+    // internally at the right points. The driver just passes them
+    // through without knowing what they do.
+    //
+    // With `NoHooks`, all hook calls are inlined to nothing by the
+    // compiler — zero overhead.
 
     /// Start the loop with initial user messages. Returns the first effect.
-    pub fn start(&mut self, messages: Vec<Message>) -> Effect {
+    pub fn start(&mut self, messages: Vec<Message>, hooks: &mut impl Hooks) -> Effect {
         self.state.messages.extend(messages);
         self.state.turn = 0;
         self.event_queue.push_back(Event::AgentStart);
-        self.begin_turn()
+        self.begin_turn(hooks)
     }
 
     /// Resume after an `Effect::NeedLlm`. Provide the LLM response or error.
-    pub fn resume_llm(&mut self, result: Result<LlmResponse, TransportError>) -> Effect {
+    pub fn resume_llm(
+        &mut self,
+        result: Result<LlmResponse, TransportError>,
+        hooks: &mut impl Hooks,
+    ) -> Effect {
         assert!(matches!(self.phase, Phase::WaitingForLlm));
 
         if self.aborted {
@@ -406,10 +526,14 @@ impl AgentLoop {
                     )));
                 }
                 // Retry: yield another NeedLlm with the same state.
-                self.emit_need_llm()
+                self.emit_need_llm(hooks)
             }
-            Ok(resp) => {
+            Ok(mut resp) => {
                 self.consecutive_transport_errors = 0;
+
+                // ── Hook: after_llm ──
+                // Hooks can inspect/modify the response before processing.
+                hooks.after_llm(&mut resp, &self.state);
 
                 // Track tokens.
                 self.state.total_input_tokens += resp.input_tokens;
@@ -427,26 +551,39 @@ impl AgentLoop {
                 self.state.messages.push(resp.message);
 
                 if resp.stop_reason == StopReason::Error {
-                    return self.end_turn_and_maybe_continue();
+                    return self.end_turn_and_maybe_continue(hooks);
                 }
 
                 if tool_calls.is_empty() {
                     // Model is done for this turn — no tools to run.
-                    self.end_turn_and_maybe_continue()
+                    self.end_turn_and_maybe_continue(hooks)
                 } else {
                     // Queue up tool calls.
                     self.pending_tools = tool_calls.into();
-                    self.advance_to_next_tool()
+                    self.advance_to_next_tool(hooks)
                 }
             }
         }
     }
 
     /// Resume after an `Effect::NeedToolExec`. Provide the execution result.
-    pub fn resume_tool(&mut self, result: ToolExecResult) -> Effect {
+    pub fn resume_tool(
+        &mut self,
+        mut result: ToolExecResult,
+        hooks: &mut impl Hooks,
+    ) -> Effect {
         assert!(matches!(self.phase, Phase::WaitingForTool));
 
         let tc = self.current_tool.take().expect("no current tool call");
+
+        // ── Hook: after_tool ──
+        // Hooks can modify the result before it's recorded.
+        let req = ToolCallRequest {
+            call_id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments: tc.arguments.clone(),
+        };
+        hooks.after_tool(&req, &mut result, &self.state);
 
         if self.aborted {
             // Still record the result, then bail.
@@ -471,66 +608,75 @@ impl AgentLoop {
         });
 
         // Advance to next tool (or next LLM call).
-        self.advance_to_next_tool()
+        self.advance_to_next_tool(hooks)
     }
 
     /// Resume after an `Effect::Event`. No data needed — just acknowledgement
     /// that the caller processed the event (updated UI, etc.).
-    pub fn resume(&mut self) -> Effect {
+    pub fn resume(&mut self, hooks: &mut impl Hooks) -> Effect {
         assert!(matches!(self.phase, Phase::WaitingForEventAck));
-        self.drain_or_advance()
+        self.drain_or_advance(hooks)
     }
 
     // ── Internal state machine logic ─────────────────────────────────
 
     /// Drain queued events first; if none, advance the FSM.
-    fn drain_or_advance(&mut self) -> Effect {
+    fn drain_or_advance(&mut self, hooks: &mut impl Hooks) -> Effect {
         // Always drain events before yielding an I/O effect.
         if let Some(event) = self.event_queue.pop_front() {
+            // ── Hook: on_event ──
+            hooks.on_event(&event, &self.state);
             self.phase = Phase::WaitingForEventAck;
             return Effect::Event(event);
         }
 
         // No events — advance based on current phase.
         match &self.phase {
-            Phase::Init => self.emit_need_llm(),
+            Phase::Init => self.emit_need_llm(hooks),
             Phase::WaitingForEventAck => {
-                // We were draining events. Now figure out what to actually do.
-                // This shouldn't happen if drain logic is correct, but handle
-                // it gracefully by emitting NeedLlm.
-                self.emit_need_llm()
+                self.emit_need_llm(hooks)
             }
             Phase::Done => Effect::Done(EndReason::Done),
             _ => unreachable!("drain_or_advance called in unexpected phase"),
         }
     }
 
-    fn begin_turn(&mut self) -> Effect {
+    fn begin_turn(&mut self, hooks: &mut impl Hooks) -> Effect {
         self.state.turn += 1;
         self.event_queue
             .push_back(Event::TurnStart { turn: self.state.turn });
         self.phase = Phase::Init;
-        self.drain_or_advance()
+        self.drain_or_advance(hooks)
     }
 
-    fn emit_need_llm(&mut self) -> Effect {
+    fn emit_need_llm(&mut self, hooks: &mut impl Hooks) -> Effect {
         // First drain any pending events.
         if let Some(event) = self.event_queue.pop_front() {
+            hooks.on_event(&event, &self.state);
             self.phase = Phase::WaitingForEventAck;
             return Effect::Event(event);
         }
 
-        self.phase = Phase::WaitingForLlm;
-        Effect::NeedLlm(LlmRequest {
+        // Build the LLM request.
+        let mut req = LlmRequest {
             system_prompt: self.state.system_prompt.clone(),
             messages: self.state.messages.clone(),
             tools: self.tool_schemas.clone(),
-        })
+        };
+
+        // ── Hook: before_llm ──
+        // Hooks can mutate the request: inject context, compact messages,
+        // change tool schemas, override model params, etc.
+        hooks.before_llm(&mut req, &self.state);
+
+        self.phase = Phase::WaitingForLlm;
+        Effect::NeedLlm(req)
     }
 
-    fn advance_to_next_tool(&mut self) -> Effect {
+    fn advance_to_next_tool(&mut self, hooks: &mut impl Hooks) -> Effect {
         // Drain events first (e.g. ToolExecEnd from previous tool).
         if let Some(event) = self.event_queue.pop_front() {
+            hooks.on_event(&event, &self.state);
             self.phase = Phase::WaitingForEventAck;
             return Effect::Event(event);
         }
@@ -548,76 +694,106 @@ impl AgentLoop {
             });
             self.state.messages.push(steer_msg);
             self.skip_remaining_tools();
-            // After steering, go back to the LLM with the new context.
-            return self.drain_or_advance_to_llm();
+            return self.drain_or_advance_to_llm(hooks);
         }
 
         // Pop next tool call.
         match self.pending_tools.pop_front() {
             Some(tc) => {
-                self.event_queue.push_back(Event::ToolExecStart {
+                // Build the tool request.
+                let mut req = ToolCallRequest {
                     call_id: tc.id.clone(),
                     name: tc.name.clone(),
-                });
-                self.current_tool = Some(tc.clone());
+                    arguments: tc.arguments.clone(),
+                };
 
-                // Drain the ToolExecStart event first.
-                if let Some(event) = self.event_queue.pop_front() {
-                    self.phase = Phase::WaitingForEventAck;
-                    return Effect::Event(event);
+                // ── Hook: before_tool ──
+                // Hooks can block, replace, or let through.
+                let action = hooks.before_tool(&mut req, &self.state);
+
+                match action {
+                    ToolAction::Continue => {
+                        // Normal path: yield to driver for execution.
+                        self.event_queue.push_back(Event::ToolExecStart {
+                            call_id: req.call_id.clone(),
+                            name: req.name.clone(),
+                        });
+                        self.current_tool = Some(tc);
+
+                        // Drain the ToolExecStart event first.
+                        if let Some(event) = self.event_queue.pop_front() {
+                            hooks.on_event(&event, &self.state);
+                            self.phase = Phase::WaitingForEventAck;
+                            return Effect::Event(event);
+                        }
+
+                        self.phase = Phase::WaitingForTool;
+                        Effect::NeedToolExec(req)
+                    }
+                    ToolAction::Block { reason } => {
+                        // Hook blocked this tool. Handle internally —
+                        // the driver never sees this tool call.
+                        let mut result = ToolExecResult::error(
+                            format!("blocked: {reason}")
+                        );
+                        hooks.after_tool(&req, &mut result, &self.state);
+                        self.push_tool_result(&tc, result);
+                        // Continue to next tool.
+                        self.advance_to_next_tool(hooks)
+                    }
+                    ToolAction::Replace(mut result) => {
+                        // Hook provided a result. Handle internally —
+                        // the driver never sees this tool call.
+                        hooks.after_tool(&req, &mut result, &self.state);
+                        self.push_tool_result(&tc, result);
+                        // Continue to next tool.
+                        self.advance_to_next_tool(hooks)
+                    }
                 }
-
-                self.phase = Phase::WaitingForTool;
-                Effect::NeedToolExec(ToolCallRequest {
-                    call_id: tc.id,
-                    name: tc.name,
-                    arguments: tc.arguments,
-                })
             }
             None => {
                 // All tools done — loop back to LLM for the next turn.
-                self.emit_need_llm()
+                self.emit_need_llm(hooks)
             }
         }
     }
 
     /// After draining events (like Steered), proceed to the LLM call.
-    fn drain_or_advance_to_llm(&mut self) -> Effect {
+    fn drain_or_advance_to_llm(&mut self, hooks: &mut impl Hooks) -> Effect {
         if let Some(event) = self.event_queue.pop_front() {
+            hooks.on_event(&event, &self.state);
             self.phase = Phase::WaitingForEventAck;
             return Effect::Event(event);
         }
-        self.emit_need_llm()
+        self.emit_need_llm(hooks)
     }
 
-    fn end_turn_and_maybe_continue(&mut self) -> Effect {
+    fn end_turn_and_maybe_continue(&mut self, hooks: &mut impl Hooks) -> Effect {
         self.event_queue
             .push_back(Event::TurnEnd { turn: self.state.turn });
 
         // Check follow-up / steering before declaring done.
         if let Some(steer_msg) = self.steering_queue.pop_front() {
             self.state.messages.push(steer_msg);
-            return self.begin_turn_after_events();
+            return self.begin_turn_after_events(hooks);
         }
 
         if let Some(follow_up) = self.follow_up_queue.pop_front() {
             self.state.messages.push(follow_up);
-            return self.begin_turn_after_events();
+            return self.begin_turn_after_events(hooks);
         }
 
         // Truly done.
         self.finish(EndReason::Done)
     }
 
-    fn begin_turn_after_events(&mut self) -> Effect {
-        // Drain pending events (like TurnEnd), then start new turn.
+    fn begin_turn_after_events(&mut self, hooks: &mut impl Hooks) -> Effect {
         if let Some(event) = self.event_queue.pop_front() {
-            // After draining, we need to remember to begin a new turn.
-            // We use Init phase + pending events to handle this.
+            hooks.on_event(&event, &self.state);
             self.phase = Phase::WaitingForEventAck;
             return Effect::Event(event);
         }
-        self.begin_turn()
+        self.begin_turn(hooks)
     }
 
     fn finish(&mut self, reason: EndReason) -> Effect {
@@ -641,6 +817,10 @@ impl AgentLoop {
             content: result.content,
             is_error: result.is_error,
         };
+        self.event_queue.push_back(Event::ToolExecEnd {
+            call_id: tc.id.clone(),
+            result: tool_result.clone(),
+        });
         self.state.messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult(tool_result)],
@@ -652,8 +832,8 @@ impl AgentLoop {
 // PART 6: Convenience driver — `run_blocking`
 // ═══════════════════════════════════════════════════════════════════════
 //
-// For callers who don't need fine-grained control, this function drives
-// the loop synchronously, like v1. It's 20 lines on top of the FSM.
+// The simplest possible driver. Notice the hooks are just passed through
+// to every resume call — the driver doesn't know or care what they do.
 
 /// Trait for tools used with `run_blocking`.
 pub trait Tool: Send {
@@ -661,12 +841,14 @@ pub trait Tool: Send {
     fn execute(&self, call_id: &str, arguments: &str) -> ToolExecResult;
 }
 
-/// Simple blocking driver. Handles I/O, dispatches tools, logs events.
+/// Simple blocking driver. Hooks are passed to every step — the agent
+/// calls them internally. The driver just does I/O.
 pub fn run_blocking(
     messages: Vec<Message>,
     state: AgentState,
     tools: &[&dyn Tool],
     transport: &dyn Fn(&LlmRequest) -> Result<LlmResponse, TransportError>,
+    hooks: &mut impl Hooks,
     on_event: &mut dyn FnMut(&Event),
 ) -> (AgentState, EndReason) {
     let schemas = tools.iter().map(|t| t.schema()).collect::<Vec<_>>();
@@ -676,27 +858,26 @@ pub fn run_blocking(
         .collect();
 
     let mut agent = AgentLoop::new(state, schemas);
-    let mut effect = agent.start(messages);
+    let mut effect = agent.start(messages, hooks);
 
     loop {
         match effect {
             Effect::Event(ref ev) => {
                 on_event(ev);
-                effect = agent.resume();
+                effect = agent.resume(hooks);
             }
             Effect::NeedLlm(ref req) => {
                 let result = transport(req);
-                effect = agent.resume_llm(result);
+                effect = agent.resume_llm(result, hooks);
             }
             Effect::NeedToolExec(ref req) => {
                 let result = match tool_map.get(req.name.as_str()) {
                     Some(tool) => tool.execute(&req.call_id, &req.arguments),
                     None => ToolExecResult::error(format!("unknown tool: {}", req.name)),
                 };
-                effect = agent.resume_tool(result);
+                effect = agent.resume_tool(result, hooks);
             }
             Effect::Done(reason) => {
-                // Move state out of the loop.
                 return (agent.state.clone(), reason);
             }
         }
@@ -704,133 +885,11 @@ pub fn run_blocking(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PART 7: Example — TUI driver with non-blocking tool execution
+// PART 7: Example — async driver with non-blocking tool execution
 // ═══════════════════════════════════════════════════════════════════════
 //
-// This shows the *power* of the cooperative design: the caller can run
-// tools in background threads, pump the UI at 60fps, and handle user
-// interrupts — all without async.
-
-#[cfg(never)]
-mod tui_example {
-    use super::*;
-    use std::time::Duration;
-
-    fn run_tui_agent(
-        messages: Vec<Message>,
-        state: AgentState,
-        tools: &[&dyn Tool],
-        transport: &dyn Fn(&LlmRequest) -> Result<LlmResponse, TransportError>,
-        ui: &mut dyn TuiBackend,
-    ) -> (AgentState, EndReason) {
-        let schemas = tools.iter().map(|t| t.schema()).collect::<Vec<_>>();
-        let tool_map: std::collections::HashMap<String, &dyn Tool> = tools
-            .iter()
-            .map(|t| (t.schema().name.clone(), *t))
-            .collect();
-
-        let mut agent = AgentLoop::new(state, schemas);
-        let mut effect = agent.start(messages);
-
-        loop {
-            match effect {
-                Effect::Event(ref ev) => {
-                    ui.handle_event(ev);
-                    ui.render();
-                    effect = agent.resume();
-                }
-
-                Effect::NeedLlm(ref req) => {
-                    // Start LLM call in background thread.
-                    let req_clone = req.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let result = todo!("call LLM");
-                        let _ = tx.send(result);
-                    });
-
-                    // While waiting: pump UI, check for user input.
-                    let result = loop {
-                        // Check if LLM responded.
-                        if let Ok(r) = rx.try_recv() {
-                            break r;
-                        }
-
-                        // Poll user input — they might type a steering message.
-                        if let Some(input) = ui.poll_input(Duration::from_millis(16)) {
-                            match input {
-                                UserInput::Abort => {
-                                    agent.abort();
-                                    // Still need to wait for the LLM call to finish
-                                    // (or the transport to notice the abort).
-                                    break rx.recv().unwrap();
-                                }
-                                UserInput::Message(text) => {
-                                    agent.steer(Message::user(text));
-                                }
-                            }
-                        }
-
-                        // Render at ~60fps.
-                        ui.render();
-                    };
-
-                    effect = agent.resume_llm(result);
-                }
-
-                Effect::NeedToolExec(ref req) => {
-                    let tool = tool_map[req.name.as_str()];
-                    let call_id = req.call_id.clone();
-                    let args = req.arguments.clone();
-
-                    // Run tool in background.
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let result = tool.execute(&call_id, &args);
-                        let _ = tx.send(result);
-                    });
-
-                    // While waiting: pump UI, check for interrupts.
-                    let result = loop {
-                        if let Ok(r) = rx.try_recv() {
-                            break r;
-                        }
-                        if let Some(UserInput::Abort) = ui.poll_input(Duration::from_millis(16)) {
-                            agent.abort();
-                            break rx.recv().unwrap();
-                        }
-                        ui.render();
-                    };
-
-                    effect = agent.resume_tool(result);
-                }
-
-                Effect::Done(reason) => {
-                    return (agent.state.clone(), reason);
-                }
-            }
-        }
-    }
-
-    // Placeholder traits for the TUI example.
-    enum UserInput {
-        Abort,
-        Message(String),
-    }
-
-    trait TuiBackend {
-        fn handle_event(&mut self, event: &Event);
-        fn render(&mut self);
-        fn poll_input(&mut self, timeout: Duration) -> Option<UserInput>;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// PART 8: Example — async driver (bridge to tokio)
-// ═══════════════════════════════════════════════════════════════════════
-//
-// The core loop is sync, but integrating with async is trivial: spawn
-// the I/O as async tasks and await them in the driver.
+// Shows: async I/O, user interrupts via tokio::select!, and hooks
+// passed through transparently. The driver doesn't do hook logic.
 
 #[cfg(never)]
 mod async_example {
@@ -839,27 +898,28 @@ mod async_example {
     async fn run_async_agent(
         messages: Vec<Message>,
         state: AgentState,
-        schemas: Vec<ToolSchema>,
+        tools: &[&dyn Tool],
+        hooks: &mut impl Hooks,
     ) -> (AgentState, EndReason) {
+        let schemas = tools.iter().map(|t| t.schema()).collect::<Vec<_>>();
         let mut agent = AgentLoop::new(state, schemas);
-        let mut effect = agent.start(messages);
+        let mut effect = agent.start(messages, hooks);
 
         loop {
             match effect {
                 Effect::Event(ref _ev) => {
-                    // Handle event (log, websocket push, etc.)
-                    effect = agent.resume();
+                    // Log, websocket push, etc.
+                    effect = agent.resume(hooks);
                 }
                 Effect::NeedLlm(ref req) => {
-                    // Use an async HTTP client.
-                    let result = todo!("async_llm_call(req).await");
-                    effect = agent.resume_llm(result);
+                    let result: Result<LlmResponse, TransportError> =
+                        todo!("async_llm_call(req).await");
+                    effect = agent.resume_llm(result, hooks);
                 }
                 Effect::NeedToolExec(ref req) => {
-                    // Use tokio::task::spawn_blocking for CPU-bound tools,
-                    // or just await async tools directly.
-                    let result = todo!("async_tool_exec(req).await");
-                    effect = agent.resume_tool(result);
+                    let result: ToolExecResult =
+                        todo!("async_tool_exec(req).await");
+                    effect = agent.resume_tool(result, hooks);
                 }
                 Effect::Done(reason) => {
                     return (agent.state.clone(), reason);
@@ -870,344 +930,82 @@ mod async_example {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PART 9: Hook layer — composable extension points
+// PART 8: Composing multiple hooks
 // ═══════════════════════════════════════════════════════════════════════
 //
-// The pure effect/resume model gives the driver full control, but
-// "everything is the driver's problem" doesn't scale when you have 5+
-// independent extensions (approval gates, caching, metrics, custom tools,
-// context compaction). Each would need to be hand-wired into the driver's
-// match loop, and they'd have no way to compose without knowing about
-// each other.
+// A single struct that holds multiple hooks and implements Hooks itself.
+// This is NOT middleware wrapping the agent — it's just a convenient
+// way to combine hooks into one `&mut impl Hooks` value.
 //
-// The solution: a **Hook trait** that sits between the AgentLoop and the
-// driver's I/O. Hooks are middleware — they intercept effects and resumes
-// at well-defined points, can modify data flowing through, and compose
-// in an ordered pipeline.
-//
-// ┌────────────┐  Effect  ┌───────────────┐  Effect  ┌────────────┐
-// │ AgentLoop  │ ───────> │ HookPipeline  │ ───────> │   Driver   │
-// │  (pure)    │ <─────── │ (middleware)   │ <─────── │   (I/O)    │
-// │            │  Resume  │               │  Resume  │            │
-// └────────────┘          └───────────────┘          └────────────┘
-//
-// This maps directly to pi-mono's extension model:
-//
-// ┌────────────────────────┬─────────────────────────────────────────┐
-// │ pi-mono event          │ Hook method                            │
-// ├────────────────────────┼─────────────────────────────────────────┤
-// │ pi.on("context")       │ Hook::before_llm(&mut LlmRequest)      │
-// │ pi.on("tool_call")     │ Hook::before_tool() → ToolAction       │
-// │ pi.on("tool_result")   │ Hook::after_tool(&mut ToolExecResult)   │
-// │ pi.on("agent_start")   │ Hook::on_start()                       │
-// │ pi.on("agent_end")     │ Hook::on_end()                         │
-// │ pi.on("turn_start")    │ Hook::on_event(TurnStart)              │
-// │ pi.on("turn_end")      │ Hook::on_event(TurnEnd)                │
-// │ pi.registerTool()      │ Hook::tools() → Vec<ToolSchema>        │
-// │ pi.registerTool.exec() │ Hook::execute_tool() → Option<Result>  │
-// └────────────────────────┴─────────────────────────────────────────┘
-//
-// Key design constraints:
-//   1. The AgentLoop knows NOTHING about hooks. Zero coupling.
-//   2. Hooks are optional — plain drivers work without them.
-//   3. Hooks compose in order: first hook to block/replace wins.
-//   4. No trait objects in the core crate. Hook lives in the driver crate.
-//   5. Hooks can provide tools (like pi.registerTool) AND execute them.
-
-/// What a hook wants to do with a tool call.
-pub enum ToolAction {
-    /// Let it through — next hook (or the driver) handles it.
-    Continue,
-    /// Block execution entirely. The tool result will be an error
-    /// with the given reason.
-    Block { reason: String },
-    /// Short-circuit with this result. The actual tool never runs.
-    /// Useful for caching, mocking, sandboxing.
-    Replace(ToolExecResult),
-}
-
-/// Read-only view of agent state available to hooks.
-pub struct HookContext<'a> {
-    pub state: &'a AgentState,
-    pub turn: usize,
-    pub aborted: bool,
-}
-
-/// The extension point. Each method has a default no-op implementation,
-/// so hooks only override what they care about.
-///
-/// Hooks run in pipeline order. For `before_tool`, the first hook to
-/// return `Block` or `Replace` wins (short-circuit). For mutation methods
-/// (`before_llm`, `after_tool`, `after_llm`), all hooks run in sequence,
-/// each seeing the mutations from previous hooks.
-pub trait Hook {
-    /// Human-readable name for debugging / logging.
-    fn name(&self) -> &str { "unnamed" }
-
-    // ── Lifecycle ────────────────────────────────────────────────────
-
-    /// Called once when the agent loop starts.
-    fn on_start(&mut self, _ctx: &HookContext) {}
-
-    /// Called once when the agent loop finishes.
-    fn on_end(&mut self, _reason: &EndReason, _ctx: &HookContext) {}
-
-    /// Called for every Event the loop emits (turn boundaries, token
-    /// deltas, etc.). Hooks can log, update metrics, or push to UI.
-    fn on_event(&mut self, _event: &Event, _ctx: &HookContext) {}
-
-    // ── LLM interception ────────────────────────────────────────────
-
-    /// Called before each LLM request is sent. Can mutate the request
-    /// (add system messages, inject context, change model params).
-    /// This is pi-mono's `context` event.
-    fn before_llm(&mut self, _req: &mut LlmRequest, _ctx: &HookContext) {}
-
-    /// Called after the LLM response arrives. Can inspect or mutate.
-    fn after_llm(
-        &mut self,
-        _req: &LlmRequest,
-        _resp: &mut Result<LlmResponse, TransportError>,
-        _ctx: &HookContext,
-    ) {}
-
-    // ── Tool interception ───────────────────────────────────────────
-
-    /// Called before a tool executes. Can:
-    /// - `Continue`: pass through to the next hook / actual execution
-    /// - `Block { reason }`: reject the call (becomes an error result)
-    /// - `Replace(result)`: skip execution, use this result instead
-    ///
-    /// The request is mutable — hooks can rewrite arguments.
-    /// This is pi-mono's `tool_call` event (with `{ block: true }`).
-    fn before_tool(
-        &mut self,
-        _req: &mut ToolCallRequest,
-        _ctx: &HookContext,
-    ) -> ToolAction {
-        ToolAction::Continue
-    }
-
-    /// Called after a tool executes (or after a Replace). Can mutate
-    /// the result. This is pi-mono's `tool_result` event.
-    fn after_tool(
-        &mut self,
-        _req: &ToolCallRequest,
-        _result: &mut ToolExecResult,
-        _ctx: &HookContext,
-    ) {}
-
-    // ── Tool provision ──────────────────────────────────────────────
-
-    /// Return additional tool schemas this hook provides.
-    /// These get merged with the base schemas when building LlmRequests.
-    /// This is pi-mono's `pi.registerTool()`.
-    fn tools(&self) -> Vec<ToolSchema> { vec![] }
-
-    /// Execute a tool that this hook provides. Called only for tools
-    /// whose names match schemas returned by `tools()`. Return `None`
-    /// to fall through to the next hook or the driver's tool map.
-    fn execute_tool(
-        &mut self,
-        _call_id: &str,
-        _name: &str,
-        _arguments: &str,
-        _ctx: &HookContext,
-    ) -> Option<ToolExecResult> {
-        None
-    }
-}
+// The agent doesn't know or care. It calls hooks.before_tool() and
+// gets back a ToolAction. Whether that's one hook or ten is invisible.
 
 /// Ordered list of hooks. Runs them in sequence for each interception point.
-pub struct HookPipeline {
+/// First hook to return Block/Replace wins (short-circuit for before_tool).
+/// For mutation methods, all hooks run in sequence, each seeing mutations
+/// from previous hooks.
+pub struct HookSet {
     hooks: Vec<Box<dyn Hook>>,
 }
 
-impl HookPipeline {
-    pub fn new() -> Self {
-        HookPipeline { hooks: Vec::new() }
+/// Individual hook — same methods as `Hooks`, but designed to be composed
+/// in a `HookSet`. The only difference is that `before_tool` short-circuits:
+/// first hook to return non-Continue wins.
+pub trait Hook {
+    fn name(&self) -> &str { "unnamed" }
+    fn before_llm(&mut self, _req: &mut LlmRequest, _state: &AgentState) {}
+    fn after_llm(&mut self, _resp: &mut LlmResponse, _state: &AgentState) {}
+    fn before_tool(&mut self, _req: &mut ToolCallRequest, _state: &AgentState) -> ToolAction {
+        ToolAction::Continue
     }
+    fn after_tool(&mut self, _req: &ToolCallRequest, _result: &mut ToolExecResult, _state: &AgentState) {}
+    fn on_event(&mut self, _event: &Event, _state: &AgentState) {}
+}
 
-    /// Add a hook to the end of the pipeline. Order matters:
-    /// hooks added first run first and can short-circuit later ones.
+impl HookSet {
+    pub fn new() -> Self { HookSet { hooks: Vec::new() } }
+
     pub fn add(&mut self, hook: impl Hook + 'static) {
         self.hooks.push(Box::new(hook));
     }
+}
 
-    pub fn on_start(&mut self, ctx: &HookContext) {
-        for h in &mut self.hooks { h.on_start(ctx); }
+/// HookSet implements Hooks, so it can be passed to any resume_*() call.
+impl Hooks for HookSet {
+    fn before_llm(&mut self, req: &mut LlmRequest, state: &AgentState) {
+        for h in &mut self.hooks { h.before_llm(req, state); }
     }
 
-    pub fn on_end(&mut self, reason: &EndReason, ctx: &HookContext) {
-        for h in &mut self.hooks { h.on_end(reason, ctx); }
+    fn after_llm(&mut self, resp: &mut LlmResponse, state: &AgentState) {
+        for h in &mut self.hooks { h.after_llm(resp, state); }
     }
 
-    pub fn on_event(&mut self, event: &Event, ctx: &HookContext) {
-        for h in &mut self.hooks { h.on_event(event, ctx); }
-    }
-
-    pub fn before_llm(&mut self, req: &mut LlmRequest, ctx: &HookContext) {
-        for h in &mut self.hooks { h.before_llm(req, ctx); }
-    }
-
-    pub fn after_llm(
-        &mut self,
-        req: &LlmRequest,
-        resp: &mut Result<LlmResponse, TransportError>,
-        ctx: &HookContext,
-    ) {
-        for h in &mut self.hooks { h.after_llm(req, resp, ctx); }
-    }
-
-    /// Run before_tool hooks. First hook to return Block or Replace wins.
-    pub fn before_tool(
-        &mut self,
-        req: &mut ToolCallRequest,
-        ctx: &HookContext,
-    ) -> ToolAction {
+    fn before_tool(&mut self, req: &mut ToolCallRequest, state: &AgentState) -> ToolAction {
         for h in &mut self.hooks {
-            match h.before_tool(req, ctx) {
+            match h.before_tool(req, state) {
                 ToolAction::Continue => continue,
-                action => return action,
+                action => return action, // first non-Continue wins
             }
         }
         ToolAction::Continue
     }
 
-    pub fn after_tool(
-        &mut self,
-        req: &ToolCallRequest,
-        result: &mut ToolExecResult,
-        ctx: &HookContext,
-    ) {
-        for h in &mut self.hooks { h.after_tool(req, result, ctx); }
+    fn after_tool(&mut self, req: &ToolCallRequest, result: &mut ToolExecResult, state: &AgentState) {
+        for h in &mut self.hooks { h.after_tool(req, result, state); }
     }
 
-    /// Collect all tool schemas from all hooks.
-    pub fn tool_schemas(&self) -> Vec<ToolSchema> {
-        self.hooks.iter().flat_map(|h| h.tools()).collect()
-    }
-
-    /// Try to execute a tool via hooks. Returns None if no hook handles it.
-    pub fn execute_tool(
-        &mut self,
-        call_id: &str,
-        name: &str,
-        arguments: &str,
-        ctx: &HookContext,
-    ) -> Option<ToolExecResult> {
-        for h in &mut self.hooks {
-            if let Some(result) = h.execute_tool(call_id, name, arguments, ctx) {
-                return Some(result);
-            }
-        }
-        None
+    fn on_event(&mut self, event: &Event, state: &AgentState) {
+        for h in &mut self.hooks { h.on_event(event, state); }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PART 10: run_with_hooks — the standard driver with hook integration
+// PART 9: Concrete hook examples
 // ═══════════════════════════════════════════════════════════════════════
 //
-// This replaces `run_blocking` for callers who use hooks. The match loop
-// is the same, but every transition flows through the HookPipeline.
-// Callers who don't need hooks can still use `run_blocking`.
-
-pub fn run_with_hooks(
-    messages: Vec<Message>,
-    state: AgentState,
-    tools: &[&dyn Tool],
-    transport: &dyn Fn(&LlmRequest) -> Result<LlmResponse, TransportError>,
-    hooks: &mut HookPipeline,
-    on_event: &mut dyn FnMut(&Event),
-) -> (AgentState, EndReason) {
-    // Merge base tool schemas with hook-provided schemas.
-    let mut schemas: Vec<ToolSchema> = tools.iter().map(|t| t.schema()).collect();
-    schemas.extend(hooks.tool_schemas());
-
-    let tool_map: std::collections::HashMap<&str, &dyn Tool> = tools
-        .iter()
-        .map(|t| (t.schema().name.as_str(), *t))
-        .collect();
-
-    let mut agent = AgentLoop::new(state, schemas);
-    let mut effect = agent.start(messages);
-    let mut turn: usize = 0;
-
-    let ctx = HookContext { state: &agent.state, turn, aborted: false };
-    hooks.on_start(&ctx);
-
-    loop {
-        let ctx = HookContext { state: &agent.state, turn, aborted: false };
-
-        match effect {
-            Effect::Event(ref ev) => {
-                // Let hooks observe events (metrics, logging, UI).
-                hooks.on_event(ev, &ctx);
-                on_event(ev);
-
-                // Track turn boundaries.
-                if matches!(ev, Event::TurnStart) { turn += 1; }
-
-                effect = agent.resume();
-            }
-
-            Effect::NeedLlm(ref mut req) => {
-                // Hook: context transform, prompt injection, model override.
-                hooks.before_llm(req, &ctx);
-
-                let mut result = transport(req);
-
-                // Hook: inspect/modify response, log, cache.
-                hooks.after_llm(req, &mut result, &ctx);
-
-                effect = agent.resume_llm(result);
-            }
-
-            Effect::NeedToolExec(ref mut req) => {
-                // Hook: approval gate, argument rewriting, blocking.
-                let action = hooks.before_tool(req, &ctx);
-
-                let mut result = match action {
-                    ToolAction::Continue => {
-                        // Try hook-provided tools first, then the base tool map.
-                        hooks.execute_tool(&req.call_id, &req.name, &req.arguments, &ctx)
-                            .unwrap_or_else(|| {
-                                match tool_map.get(req.name.as_str()) {
-                                    Some(tool) => tool.execute(&req.call_id, &req.arguments),
-                                    None => ToolExecResult::error(
-                                        format!("unknown tool: {}", req.name)
-                                    ),
-                                }
-                            })
-                    }
-                    ToolAction::Block { reason } => {
-                        ToolExecResult::error(format!("blocked by hook: {}", reason))
-                    }
-                    ToolAction::Replace(result) => result,
-                };
-
-                // Hook: modify result, add metadata, sanitize output.
-                hooks.after_tool(req, &mut result, &ctx);
-
-                effect = agent.resume_tool(result);
-            }
-
-            Effect::Done(ref reason) => {
-                let ctx = HookContext { state: &agent.state, turn, aborted: false };
-                hooks.on_end(reason, &ctx);
-                return (agent.state.clone(), reason.clone());
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// PART 11: Concrete hook examples
-// ═══════════════════════════════════════════════════════════════════════
-//
-// These show how pi-mono-style extensions map onto the Hook trait.
-// Each is self-contained — they compose by adding them to a pipeline.
+// Each hook is self-contained with its own state. They compose by adding
+// them to a HookSet. The agent calls them internally — the driver never
+// does hook dispatch.
 
 #[cfg(never)]
 mod hook_examples {
@@ -1216,18 +1014,12 @@ mod hook_examples {
 
     // ─── Example 1: Approval Gate ────────────────────────────────────
     //
-    // Equivalent to pi-mono's:
-    //   pi.on("tool_call", async (event, ctx) => {
-    //     if (event.toolName === "bash" && event.input.command?.includes("rm")) {
-    //       const ok = await ctx.ui.confirm("Allow?");
-    //       if (!ok) return { block: true, reason: "User denied" };
-    //     }
-    //   });
+    // The agent calls before_tool() internally. If the hook returns
+    // Block, the agent handles it — creates an error result, records it,
+    // and moves to the next tool. The driver never sees the blocked call.
 
     struct ApprovalGate {
-        /// Tool names that require user approval.
         gated_tools: Vec<String>,
-        /// Callback that asks the user. Returns true = allow.
         ask: Box<dyn FnMut(&ToolCallRequest) -> bool>,
     }
 
@@ -1237,14 +1029,14 @@ mod hook_examples {
         fn before_tool(
             &mut self,
             req: &mut ToolCallRequest,
-            _ctx: &HookContext,
+            _state: &AgentState,
         ) -> ToolAction {
             if self.gated_tools.iter().any(|t| t == &req.name) {
                 if (self.ask)(req) {
                     ToolAction::Continue
                 } else {
                     ToolAction::Block {
-                        reason: format!("User denied execution of '{}'", req.name),
+                        reason: format!("User denied '{}'", req.name),
                     }
                 }
             } else {
@@ -1253,338 +1045,196 @@ mod hook_examples {
         }
     }
 
-    // ─── Example 2: Response Cache ───────────────────────────────────
+    // ─── Example 2: Metrics Collector ────────────────────────────────
     //
-    // Caches LLM responses by request hash. Useful for deterministic
-    // replay, testing, and cost reduction during development.
-
-    struct ResponseCache {
-        cache: HashMap<u64, LlmResponse>,
-    }
-
-    impl ResponseCache {
-        fn hash_request(req: &LlmRequest) -> u64 {
-            // In practice, use a proper hasher over serialized request.
-            0 // placeholder
-        }
-    }
-
-    impl Hook for ResponseCache {
-        fn name(&self) -> &str { "response-cache" }
-
-        fn before_llm(&mut self, req: &mut LlmRequest, _ctx: &HookContext) {
-            // Could inject a cache-control header or marker.
-        }
-
-        fn after_llm(
-            &mut self,
-            req: &LlmRequest,
-            resp: &mut Result<LlmResponse, TransportError>,
-            _ctx: &HookContext,
-        ) {
-            let key = Self::hash_request(req);
-            if let Ok(r) = resp {
-                self.cache.insert(key, r.clone());
-            }
-        }
-
-        // To serve from cache, you'd wrap the transport function itself.
-        // Or add a before_llm that sets a flag checked by the driver.
-        // The hook layer doesn't replace the transport — it wraps it.
-    }
-
-    // ─── Example 3: Metrics Collector ────────────────────────────────
-    //
-    // Counts turns, tool calls, tokens, errors. Pure observer — never
-    // modifies anything.
+    // Pure observer — never modifies anything. Hook owns its counters.
 
     struct Metrics {
         turns: usize,
         tool_calls: usize,
         tool_errors: usize,
-        llm_calls: usize,
-        llm_errors: usize,
     }
 
     impl Hook for Metrics {
         fn name(&self) -> &str { "metrics" }
 
-        fn on_event(&mut self, event: &Event, _ctx: &HookContext) {
-            if matches!(event, Event::TurnStart) {
+        fn on_event(&mut self, event: &Event, _state: &AgentState) {
+            if let Event::TurnStart { .. } = event {
                 self.turns += 1;
             }
-        }
-
-        fn after_llm(
-            &mut self,
-            _req: &LlmRequest,
-            resp: &mut Result<LlmResponse, TransportError>,
-            _ctx: &HookContext,
-        ) {
-            self.llm_calls += 1;
-            if resp.is_err() { self.llm_errors += 1; }
         }
 
         fn after_tool(
             &mut self,
             _req: &ToolCallRequest,
             result: &mut ToolExecResult,
-            _ctx: &HookContext,
+            _state: &AgentState,
         ) {
             self.tool_calls += 1;
             if result.is_error { self.tool_errors += 1; }
         }
-
-        fn on_end(&mut self, _reason: &EndReason, _ctx: &HookContext) {
-            eprintln!(
-                "[metrics] turns={} tools={} (err={}) llm={} (err={})",
-                self.turns, self.tool_calls, self.tool_errors,
-                self.llm_calls, self.llm_errors,
-            );
-        }
     }
 
-    // ─── Example 4: Extension-Provided Tool ──────────────────────────
+    // ─── Example 3: Context Compaction ───────────────────────────────
     //
-    // Equivalent to pi-mono's:
-    //   pi.registerTool({
-    //     name: "todo_list",
-    //     parameters: Type.Object({ action: StringEnum(["add", "list"]) }),
-    //     async execute(id, params, signal, onUpdate, ctx) { ... }
-    //   });
-    //
-    // The hook provides both the schema (so the LLM knows about it)
-    // and the execution (so the driver doesn't need a separate tool map
-    // entry).
-
-    struct TodoListHook {
-        items: Vec<String>,
-    }
-
-    impl Hook for TodoListHook {
-        fn name(&self) -> &str { "todo-list" }
-
-        fn tools(&self) -> Vec<ToolSchema> {
-            vec![ToolSchema {
-                name: "todo_list".into(),
-                description: "Manage a todo list".into(),
-                parameters: r#"{
-                    "type": "object",
-                    "properties": {
-                        "action": { "type": "string", "enum": ["add", "list", "clear"] },
-                        "text": { "type": "string" }
-                    },
-                    "required": ["action"]
-                }"#.into(),
-            }]
-        }
-
-        fn execute_tool(
-            &mut self,
-            _call_id: &str,
-            name: &str,
-            arguments: &str,
-            _ctx: &HookContext,
-        ) -> Option<ToolExecResult> {
-            if name != "todo_list" { return None; }
-
-            // In practice, parse arguments properly.
-            let result = if arguments.contains("\"list\"") {
-                let list = self.items.iter()
-                    .enumerate()
-                    .map(|(i, s)| format!("{}. {}", i + 1, s))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                ToolExecResult::success(if list.is_empty() {
-                    "No items.".into()
-                } else {
-                    list
-                })
-            } else if arguments.contains("\"add\"") {
-                // Extract text (simplified).
-                self.items.push("new item".into());
-                ToolExecResult::success("Added.".into())
-            } else if arguments.contains("\"clear\"") {
-                self.items.clear();
-                ToolExecResult::success("Cleared.".into())
-            } else {
-                ToolExecResult::error("Unknown action".into())
-            };
-
-            Some(result)
-        }
-    }
-
-    // ─── Example 5: Context Compaction ───────────────────────────────
-    //
-    // Equivalent to pi-mono's `context` event handler that trims the
-    // conversation when it gets too long. Watches token counts and
-    // rewrites the LlmRequest's messages before they're sent.
+    // Rewrites the LlmRequest before the agent yields it. The agent
+    // builds the request, calls hooks.before_llm(), then yields the
+    // (potentially modified) request.
 
     struct ContextCompactor {
-        max_tokens: usize,
+        max_estimated_tokens: usize,
     }
 
     impl Hook for ContextCompactor {
         fn name(&self) -> &str { "context-compactor" }
 
-        fn before_llm(&mut self, req: &mut LlmRequest, ctx: &HookContext) {
-            // Estimate token count (simplified).
-            let estimated_tokens: usize = req.messages.iter()
+        fn before_llm(&mut self, req: &mut LlmRequest, _state: &AgentState) {
+            let estimated: usize = req.messages.iter()
                 .flat_map(|m| &m.content)
                 .map(|b| match b {
-                    ContentBlock::Text(t) => t.len() / 4, // rough estimate
+                    ContentBlock::Text(t) => t.len() / 4,
                     _ => 50,
                 })
                 .sum();
 
-            if estimated_tokens > self.max_tokens {
-                // Strategy: keep system + first message + last N messages.
-                // In practice, you'd summarize the middle.
+            if estimated > self.max_estimated_tokens && req.messages.len() > 4 {
                 let len = req.messages.len();
-                if len > 4 {
-                    let keep_start = 1; // system prompt
-                    let keep_end = 3;   // recent context
-                    let summary = Message::user(format!(
-                        "[Context compacted: {} messages summarized]",
-                        len - keep_start - keep_end,
-                    ));
-                    let mut compacted = Vec::new();
-                    compacted.extend_from_slice(&req.messages[..keep_start]);
-                    compacted.push(summary);
-                    compacted.extend_from_slice(&req.messages[len - keep_end..]);
-                    req.messages = compacted;
-                }
+                let mut compacted = Vec::new();
+                compacted.extend_from_slice(&req.messages[..1]);
+                compacted.push(Message::user(format!(
+                    "[{} messages compacted]", len - 4,
+                )));
+                compacted.extend_from_slice(&req.messages[len - 3..]);
+                req.messages = compacted;
             }
         }
     }
 
     // ─── Composition ─────────────────────────────────────────────────
     //
-    // All five hooks compose in a single pipeline. Order matters:
-    // - ApprovalGate runs before_tool FIRST (can block before anything else)
-    // - Metrics runs after_tool LAST (sees the final result)
+    // All hooks compose in a HookSet. The driver just passes it through.
 
     fn example_composition() {
-        let mut pipeline = HookPipeline::new();
+        let mut hooks = HookSet::new();
 
-        // Order: approval checks first, then tool provision, then metrics last.
-        pipeline.add(ApprovalGate {
-            gated_tools: vec!["bash".into(), "write".into()],
-            ask: Box::new(|req| {
-                eprintln!("Allow {}? [y/n]", req.name);
-                true // placeholder
-            }),
+        // Order matters for before_tool: approval runs first.
+        hooks.add(ApprovalGate {
+            gated_tools: vec!["bash".into()],
+            ask: Box::new(|_req| true),
         });
-        pipeline.add(TodoListHook { items: vec![] });
-        pipeline.add(ContextCompactor { max_tokens: 100_000 });
-        pipeline.add(ResponseCache { cache: HashMap::new() });
-        pipeline.add(Metrics {
-            turns: 0, tool_calls: 0, tool_errors: 0,
-            llm_calls: 0, llm_errors: 0,
-        });
+        hooks.add(ContextCompactor { max_estimated_tokens: 100_000 });
+        hooks.add(Metrics { turns: 0, tool_calls: 0, tool_errors: 0 });
 
-        // Now pass `pipeline` to `run_with_hooks()`.
-        // Each hook fires at its interception points, in pipeline order.
-        // They don't know about each other — they just see the data
-        // flowing through.
+        // Now use it — the driver is unchanged:
+        //
+        //   let mut effect = agent.start(messages, &mut hooks);
+        //   loop {
+        //       match effect {
+        //           Effect::NeedLlm(ref req) => {
+        //               let result = transport(req);
+        //               effect = agent.resume_llm(result, &mut hooks);
+        //           }
+        //           Effect::NeedToolExec(ref req) => {
+        //               let result = execute(req);
+        //               effect = agent.resume_tool(result, &mut hooks);
+        //           }
+        //           Effect::Event(ref ev) => {
+        //               display(ev);
+        //               effect = agent.resume(&mut hooks);
+        //           }
+        //           Effect::Done(reason) => break,
+        //       }
+        //   }
+        //
+        // The driver is 12 lines. It doesn't know hooks exist.
+        // The agent calls hooks internally and handles Block/Replace itself.
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PART 12: Design notes
+// PART 10: The state machine — how async tool execution works
 // ═══════════════════════════════════════════════════════════════════════
 //
-// THE EFFECT PATTERN (aka "algebraic effects", "free monad", "command pattern")
+// The agent loop is a state machine with these phases:
 //
-// The core idea: separate *describing* what to do from *doing* it.
-// The loop is a pure function: (State, Input) → (State, Effect).
-// The driver is the interpreter that gives meaning to effects.
+//   Init ──┐
+//          ▼
+//   ┌─→ WaitingForLlm ──→ (process response)
+//   │         │
+//   │    has tool calls?
+//   │    ├── yes ─→ run hooks.before_tool()
+//   │    │         ├── Continue ─→ WaitingForTool ──→ (driver runs it)
+//   │    │         ├── Block ─→ handle internally, next tool
+//   │    │         └── Replace ─→ handle internally, next tool
+//   │    │
+//   │    └── no ─→ check follow_up / steering ─→ Done or begin_turn
+//   │              │
+//   │    all tools done ─────────────────────┘
+//   │              │
+//   └──────────────┘
 //
-// This pattern is well-established in:
-//   - Elm's Cmd/Sub model
-//   - Redux-saga's effects
-//   - Haskell's free monads
-//   - Game engines' command buffers
+// KEY INSIGHT: when hooks Block or Replace a tool, the state machine
+// handles it internally (records the result, advances to next tool)
+// WITHOUT yielding to the driver. The driver only sees NeedToolExec
+// for tools that actually need external execution.
 //
-// In Rust, it maps naturally to enums + match, with no special language
-// support needed. No Pin, no Future, no async, no trait objects in the
-// core — just enums and structs.
+// This means if the LLM calls tools [A, B, C] and the hook blocks A
+// and replaces B, the driver only sees one NeedToolExec (for C).
+// Tools A and B are handled inside the resume_llm() → advance_to_next_tool()
+// chain — invisible to the driver.
 //
+// For async tool execution, the flow is:
 //
-// WHY HOOKS ARE A SEPARATE LAYER (not baked into AgentLoop):
+//   1. agent yields Effect::NeedToolExec(req)  — "I need this tool run"
+//   2. driver starts execution (thread, tokio::spawn, etc. — its choice)
+//   3. driver awaits/polls the result
+//   4. driver calls agent.resume_tool(result, &mut hooks) — "here's the result"
+//   5. agent processes result (hooks.after_tool runs inside), yields next effect
 //
-// Hooks live in the driver crate, not the core. This preserves:
-//   1. Core purity — AgentLoop has zero knowledge of Hook.
-//   2. Optional adoption — you can use AgentLoop without hooks.
-//   3. Custom hook implementations — nothing stops you from writing
-//      your own hook dispatch instead of using HookPipeline.
-//   4. Testability — test hooks in isolation by calling their methods
-//      directly with mock HookContexts.
+// The agent doesn't know or care whether execution was sync or async.
+// The "async" part is entirely the driver's problem. This is what makes
+// the effect/resume protocol so powerful — the state machine is just:
+//   "I need X" → (time passes) → "here's X" → "I need Y" → ...
 //
-// The Hook trait uses dynamic dispatch (Box<dyn Hook>) because:
-//   - Extensions are loaded at runtime (from config, CLI flags, etc.)
-//   - The number of hooks is small (5-20), so vtable overhead is noise
-//   - It matches how pi-mono loads extensions (dynamic, hot-reloadable)
-//   - For compile-time-known hooks, you can skip the trait entirely
-//     and just call functions directly in your driver loop.
-//
-//
-// WHY HOOKS USE RETURN VALUES (not callbacks):
-//
-// pi-mono's `{ block: true, reason: "..." }` return pattern maps cleanly
-// to our `ToolAction` enum. This avoids the borrow-checker headaches of
-// hooks mutating shared state through callbacks:
-//
-//   // BAD: callback-based (borrow hell in Rust)
-//   hook.before_tool(req, |agent| { agent.abort(); });
-//
-//   // GOOD: return-value-based (the driver acts on the return)
-//   match hook.before_tool(req) {
-//       ToolAction::Block { reason } => { /* driver handles it */ }
-//       ...
-//   }
+// There's no Future, no Pin, no Poll. The driver bridges to whatever
+// execution model it uses.
 //
 //
-// COMPARISON WITH PI-MONO'S EXTENSION MODEL:
+// WHY HOOKS ARE PASSED ON EVERY STEP (not stored):
 //
-// pi-mono uses an event emitter (`pi.on("tool_call", handler)`) with
-// async handlers that receive an ExtensionContext. Our Hook trait is
-// the Rust equivalent:
+//   1. No lifetime entanglement — AgentLoop is 'static, serialisable,
+//      cloneable. Storing &mut impl Hooks would infect it with lifetimes.
 //
-//   - `pi.on("event_name", handler)` → implement the corresponding
-//     Hook method.
-//   - `pi.registerTool(schema)` → return it from `Hook::tools()`.
-//   - `pi.registerCommand("/cmd")` → not in the core; the driver
-//     registers commands separately (they're UI, not agent logic).
-//   - `ctx.ui.confirm()` → the hook's `ask` callback (or channel)
-//     bridges to whatever UI system the driver uses.
-//   - `pi.sendMessage()` → call `agent.steer()` from the driver after
-//     a hook returns an action that requires injecting a message.
-//   - Hot-reload → replace hooks in the pipeline at runtime. The
-//     `HookPipeline` owns `Box<dyn Hook>` so you can swap them.
+//   2. Hooks own their state — they might hold DB connections, UI handles,
+//      file locks. Storing them inside the agent would be bizarre.
+//
+//   3. The driver controls hook lifetime — create hooks, pass them in,
+//      inspect their state between steps, swap them out mid-run.
+//
+//   4. Zero overhead opt-out — with NoHooks, all hook calls inline to
+//      nothing. No vtable, no indirection, no allocation.
+//
+//   5. Testing — pass mock hooks for one step, real hooks for another.
+//      Or pass NoHooks and just test the state machine in isolation.
 //
 //
-// WHAT HOOKS CAN'T DO (by design):
+// WHAT HOOKS CAN AND CANNOT DO:
 //
-//   - Hooks cannot directly mutate AgentLoop internal state.
-//     They see a read-only HookContext. Mutations flow through the
-//     effect/resume protocol (modify the LlmRequest, modify the
-//     ToolExecResult, return ToolAction::Block, etc.).
+//   CAN:
+//     - Read agent state (messages, turn count, token totals)
+//     - Mutate data flowing through (LlmRequest, ToolExecResult, etc.)
+//     - Block or replace tool calls (via ToolAction return value)
+//     - Observe all events (on_event)
+//     - Own arbitrary internal state (counters, caches, connections)
 //
-//   - Hooks cannot inject arbitrary messages into the conversation.
-//     That's the driver's job via agent.steer() / agent.follow_up().
-//     A hook can *signal* to the driver that it should steer (e.g.,
-//     by returning a custom ToolAction variant or setting a flag),
-//     but the driver decides when and how.
+//   CANNOT:
+//     - Directly mutate agent internal state (messages, phase, queues)
+//     - Inject messages into the conversation (that's steer()/follow_up())
+//     - Change state machine transitions (the FSM is fixed)
+//     - Call async functions (hooks are sync; the driver handles async)
 //
-//   - Hooks cannot change the flow of the state machine (skip a turn,
-//     force a retry). The FSM's transitions are fixed. Hooks influence
-//     the *data* flowing through transitions, not the transitions
-//     themselves.
-//
-// This keeps the core loop's behavior predictable and auditable,
-// while still allowing powerful extension points at every I/O boundary.
+// This keeps the agent's behavior predictable: hooks influence the DATA
+// flowing through transitions, not the transitions themselves.
 
 fn main() {
     println!("See the code and comments above for the proposed architecture.");
