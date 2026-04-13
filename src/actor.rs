@@ -3,7 +3,7 @@ use crate::context::{Context, ContextRef};
 use crate::addr::Message;
 
 use async_trait::async_trait;
-use std::ops::Generator;
+use std::ops::Coroutine;
 use crate::Addr;
 
 pub trait Actor: Sized + 'static {

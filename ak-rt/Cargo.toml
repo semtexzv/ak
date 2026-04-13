@@ -20,9 +20,9 @@ path = "src/lib.rs"
 [dependencies]
 futures = { package = "futures-preview", version  = "0.3.0-alpha.19" }
 
-tokio = { version = "0.2.0-alpha.6" }
+tokio = { version = "=0.2.0-alpha.6" }
 tokio-timer = "=0.3.0-alpha.6"
-tokio-executor = "=0.2.0-alpha.6"
+tokio-executor = { version = "=0.2.0-alpha.6", features = ["current-thread"] }
 tokio-net = "=0.2.0-alpha.6"
 
 copyless = "0.1.4"

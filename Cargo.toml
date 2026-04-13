@@ -33,7 +33,7 @@ package = "ak-rt"
 version = "0.1.0"
 
 [workspace]
-members = [".", "ak-codegen", "ak-rt" ]
+members = [".", "ak-codegen", "ak-rt", "ak-factorio-rpg" ]
 
 
 [patch.crates-io]

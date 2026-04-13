@@ -1,4 +1,4 @@
-#![feature(box_syntax)]
+// box_syntax feature removed in Rust 1.70+
 
 extern crate proc_macro;
 
